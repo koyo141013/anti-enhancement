@@ -1,5 +1,4 @@
--- [anti-enhancement v0.2.9.7 재배포 금지 재배포 시 IP 딸거임]
--- Early anti-kick / ClientAlert (Harion-style)
+-- [anti-enhancement v0.2.8.2 재배포 금지]
 pcall(function()
 	local lp = game:GetService("Players").LocalPlayer
 	if not lp then return end
@@ -1221,6 +1220,39 @@ local function _tcAddConsumer()
 					end
 					return unpack(result)
 				end
+				pcall(function()
+					local ps = player.PlayerScripts
+					local knifeMod = ps.Modules.Items:FindFirstChild("Knife")
+						or ps.Modules.ItemTypes:FindFirstChild("Melee")
+						or ps.Modules.ItemTypes:FindFirstChild("Knife")
+					if knifeMod then
+						local knife = require(knifeMod)
+						if knife and type(knife.StartAiming) == "function" then
+							weaponState.OriginalKnifeStartAiming = knife.StartAiming
+							knife.StartAiming = function(self, ...)
+								if hasInfoOptions() and isLocalItem(self) then applyInfoOptions(self) end
+								if weaponState.Enabled and weaponState.AlwaysBackstab and isLocalItem(self) then
+									pcall(function()
+										if self.Info then self.Info.AlwaysBackstab = true end
+										if self.Data then self.Data.AlwaysBackstab = true end
+									end)
+								end
+								return weaponState.OriginalKnifeStartAiming(self, ...)
+							end
+						end
+						if knife and type(knife.StartShooting) == "function" then
+							weaponState.OriginalKnifeStartShooting = knife.StartShooting
+							knife.StartShooting = function(self, ...)
+								if weaponState.Enabled and weaponState.AlwaysBackstab and isLocalItem(self) then
+									pcall(function()
+										if self.Info then self.Info.AlwaysBackstab = true end
+									end)
+								end
+								return weaponState.OriginalKnifeStartShooting(self, ...)
+							end
+						end
+					end
+				end)
 				weaponState.Installed = true
 			end)
 			if ok then
@@ -1232,6 +1264,485 @@ local function _tcAddConsumer()
 		end
 
 		env.installWeaponHooks = installWeaponHooks
+
+		
+		-- ========== Harion skin system (executor APIs) ==========
+		local genv = (type(getgenv) == "function" and getgenv()) or _G
+		genv._AE_Skin = genv._AE_Skin or {}
+		local SkinState = genv._AE_Skin
+		SkinState.equip = SkinState.equip or {}
+		SkinState.finv = SkinState.finv or {}
+		env._harionEquip = SkinState.equip
+		env._harionFinv = SkinState.finv
+
+		local function safe_newcclosure(fn)
+			if type(newcclosure) == "function" then
+				local ok, res = pcall(newcclosure, fn)
+				if ok and res then return res end
+			end
+			return fn
+		end
+
+		local function safe_hookfunction(target, replacement)
+			if type(hookfunction) ~= "function" then return nil end
+			local ok, res = pcall(hookfunction, target, replacement)
+			if ok then return res end
+			return nil
+		end
+
+		task.spawn(function()
+			for attempt = 1, 80 do
+				if SkinState.Ready then
+					env._harionSkinSystemReady = true
+					return
+				end
+				local okInit, errInit = pcall(function()
+					local lp = player
+					local reps = ReplicatedStorage
+					local modules = reps:FindFirstChild("Modules")
+					if not modules then error("Modules missing — join match") end
+
+					local elib, clib, ilib, dctrl, fctrl, citem
+					pcall(function() elib = require(modules:FindFirstChild("EnumLibrary") or modules.EnumLibrary) end)
+					pcall(function()
+						if elib and elib.WaitForEnumBuilder then elib:WaitForEnumBuilder() end
+					end)
+					pcall(function() clib = require(modules:FindFirstChild("CosmeticLibrary") or modules.CosmeticLibrary) end)
+					pcall(function() ilib = require(modules:FindFirstChild("ItemLibrary") or modules.ItemLibrary) end)
+					pcall(function()
+						local ps = lp:FindFirstChild("PlayerScripts") or lp:WaitForChild("PlayerScripts", 2)
+						local ctrls = ps and (ps:FindFirstChild("Controllers") or ps:WaitForChild("Controllers", 2))
+						if ctrls then
+							pcall(function() dctrl = require(ctrls:FindFirstChild("PlayerDataController") or ctrls.PlayerDataController) end)
+							pcall(function() fctrl = require(ctrls:FindFirstChild("FighterController") or ctrls.FighterController) end)
+						end
+						pcall(function()
+							citem = require(ps.Modules.ClientReplicatedClasses.ClientFighter.ClientItem)
+						end)
+					end)
+
+					if not clib or type(clib.Cosmetics) ~= "table" then error("CosmeticLibrary not ready") end
+					if not dctrl then error("PlayerDataController not ready") end
+
+					local equip = SkinState.equip
+					local finv = SkinState.finv
+					local coss = clib.Cosmetics
+
+					local function banned(n)
+						if type(n) ~= "string" then return true end
+						return n:find("MISSING_") or n:find("Bubblegum") or n:find("Ragdoll") or n:find("Fall Apart")
+					end
+					local function toenum(n)
+						if not elib or not elib.ToEnum then return nil end
+						local s, id = pcall(elib.ToEnum, elib, n)
+						return s and id or nil
+					end
+					local function clonecos(name, ctype, inv, favonly)
+						if banned(name) then return nil end
+						local base = coss[name]
+						if not base then return nil end
+						local d = {}
+						for k, v in pairs(base) do d[k] = v end
+						d.Name = name
+						d.Type = d.Type or ctype
+						d.Seed = d.Seed or math.random(1, 1000000)
+						d.Owned = true
+						d.Unlocked = true
+						d.Locked = false
+						d.Amount = math.max(1, tonumber(d.Amount) or 1)
+						d.Count = math.max(1, tonumber(d.Count) or 1)
+						local eid = toenum(name)
+						if eid then d.Enum = eid; d.ObjectID = d.ObjectID or eid end
+						if inv ~= nil then d.Inverted = inv end
+						if favonly ~= nil then d.OnlyUseFavorites = favonly end
+						return d
+					end
+					local function rebuildinv()
+						table.clear(finv)
+						for _, cos in pairs(equip) do
+							if type(cos) == "table" then
+								for _, cd in pairs(cos) do
+									if type(cd) == "table" and cd.Name and not banned(cd.Name) then
+										finv[cd.Name] = cd
+									end
+								end
+							end
+						end
+					end
+					local function saferep(key)
+						pcall(function()
+							local cdata = dctrl.CurrentData
+							if cdata and cdata.Replicate then cdata:Replicate(key) end
+						end)
+					end
+
+					-- OwnsCosmetic always true (Harion)
+					pcall(function()
+						clib.OwnsCosmetic = safe_newcclosure(function() return true end)
+						clib.OwnsCosmeticNormally = safe_newcclosure(function() return true end)
+						clib.OwnsCosmeticUniversally = safe_newcclosure(function() return true end)
+						clib.OwnsCosmeticForWeapon = safe_newcclosure(function() return true end)
+					end)
+
+					-- dctrl.Get → CosmeticInventory inject
+					if not SkinState.GetHooked and type(dctrl.Get) == "function" then
+						local oget = dctrl.Get
+						local hookedGet = safe_newcclosure(function(self, key)
+							local data = oget(self, key)
+							if key == "CosmeticInventory" then
+								local proxy = {}
+								if type(data) == "table" then
+									for k, v in pairs(data) do
+										if not banned(k) then proxy[k] = v end
+									end
+								end
+								for name, cosmetic in pairs(finv) do
+									if proxy[name] == nil or type(proxy[name]) == "boolean" then
+										proxy[name] = cosmetic
+									end
+								end
+								return proxy
+							end
+							return data
+						end)
+						local hf = safe_hookfunction(dctrl.Get, hookedGet)
+						if hf then
+							oget = hf
+						else
+							dctrl.Get = hookedGet
+						end
+						SkinState.GetHooked = true
+					end
+
+					-- GetWeaponData merge
+					if not SkinState.WDHooked and type(dctrl.GetWeaponData) == "function" then
+						local ogetwep = dctrl.GetWeaponData
+						local hookedWD = safe_newcclosure(function(self, wname)
+							local data = ogetwep(self, wname)
+							if not data then return nil end
+							local merged = {}
+							for k, v in pairs(data) do merged[k] = v end
+							merged.Name = wname
+							local weq = equip[wname]
+							if type(weq) == "table" then
+								for ct, cd in pairs(weq) do
+									if type(cd) == "table" then merged[ct] = cd end
+								end
+							end
+							return merged
+						end)
+						local hf = safe_hookfunction(dctrl.GetWeaponData, hookedWD)
+						if hf then
+							ogetwep = hf
+						else
+							dctrl.GetWeaponData = hookedWD
+						end
+						SkinState.WDHooked = true
+					end
+
+					-- EquipCosmetic FireServer intercept (Harion style)
+					if not SkinState.EqHooked then
+						pcall(function()
+							local rems = reps:FindFirstChild("Remotes")
+							local drems = rems and rems:FindFirstChild("Data")
+							local eqrem = drems and drems:FindFirstChild("EquipCosmetic")
+							if not eqrem or type(eqrem.FireServer) ~= "function" then return end
+							local oldFire = eqrem.FireServer
+							local intercept = safe_newcclosure(function(self, ...)
+								local args = { ... }
+								if self == eqrem then
+									local wname, ctype, cname, opts = args[1], args[2], args[3], args[4]
+									if type(wname) == "string" and type(ctype) == "string" then
+										if not cname or cname == "None" or cname == "" then
+											equip[wname] = equip[wname] or {}
+											equip[wname][ctype] = nil
+											if equip[wname] and not next(equip[wname]) then equip[wname] = nil end
+											rebuildinv()
+											task.defer(function() saferep("WeaponInventory") end)
+											return oldFire(self, ...)
+										end
+										if banned(cname) then return oldFire(self, ...) end
+										-- if already owned for real, let server handle
+										local owned = false
+										pcall(function()
+											local inv = dctrl:Get("CosmeticInventory")
+											if type(inv) == "table" and type(inv[cname]) == "table" then owned = true end
+										end)
+										equip[wname] = equip[wname] or {}
+										local cloned = clonecos(cname, ctype, type(opts) == "table" and opts.IsInverted or nil, type(opts) == "table" and opts.OnlyUseFavorites or nil)
+										if cloned then equip[wname][ctype] = cloned end
+										rebuildinv()
+										task.defer(function()
+											saferep("CosmeticInventory")
+											saferep("WeaponInventory")
+											if SkinState.ForceUpdate then SkinState.ForceUpdate(wname, ctype) end
+										end)
+										if owned then
+											return oldFire(self, ...)
+										end
+										-- unowned: client-only (Harion returns without FireServer)
+										return
+									end
+								end
+								return oldFire(self, ...)
+							end)
+							local hf = safe_hookfunction(eqrem.FireServer, intercept)
+							if hf then
+								oldFire = hf
+							else
+								eqrem.FireServer = intercept
+							end
+							SkinState.EqHooked = true
+						end)
+					end
+
+					-- ClientItem._CreateViewModel inject Skin
+					if citem and type(citem._CreateViewModel) == "function" and not SkinState.CVMHooked then
+						local ocvm = citem._CreateViewModel
+						local hookedCVM = safe_newcclosure(function(self, vmref)
+							local wname = self.Name
+							local wplr = self.ClientFighter and self.ClientFighter.Player
+							if wplr == lp and type(equip[wname]) == "table" and type(vmref) == "table" then
+								local cos = equip[wname]
+								pcall(function()
+									local data = vmref.Data
+									if type(data) ~= "table" and type(self.ToEnum) == "function" then
+										local dk = self:ToEnum("Data")
+										if dk and type(vmref[dk]) == "table" then data = vmref[dk] end
+									end
+									if type(data) == "table" then
+										if cos.Skin then
+											data.Skin = cos.Skin
+											pcall(function()
+												if self.ToEnum then
+													local sk = self:ToEnum("Skin")
+													if sk ~= nil then data[sk] = cos.Skin end
+												end
+											end)
+										end
+										if cos.Wrap then data.Wrap = cos.Wrap end
+										if cos.Charm then data.Charm = cos.Charm end
+									end
+								end)
+							end
+							return ocvm(self, vmref)
+						end)
+						local hf = safe_hookfunction(citem._CreateViewModel, hookedCVM)
+						if hf then
+							ocvm = hf
+						else
+							citem._CreateViewModel = hookedCVM
+						end
+						SkinState.CVMHooked = true
+					end
+
+					-- ClientItem.Get Skin override
+					if citem and type(citem.Get) == "function" and not SkinState.ItemGetHooked then
+						local ogetItem = citem.Get
+						local hookedGet = safe_newcclosure(function(self, key)
+							local wplr = self.ClientFighter and self.ClientFighter.Player
+							if wplr == lp then
+								local weq = equip[self.Name]
+								if type(weq) == "table" then
+									if (key == "Skin" or tostring(key) == "Skin") and weq.Skin then return weq.Skin end
+									if (key == "Wrap" or tostring(key) == "Wrap") and weq.Wrap then return weq.Wrap end
+									if (key == "Charm" or tostring(key) == "Charm") and weq.Charm then return weq.Charm end
+								end
+							end
+							return ogetItem(self, key)
+						end)
+						local hf = safe_hookfunction(citem.Get, hookedGet)
+						if hf then
+							ogetItem = hf
+						else
+							citem.Get = hookedGet
+						end
+						SkinState.ItemGetHooked = true
+					end
+
+					-- ForceUpdate: Set only, never Unequip item
+					SkinState.ForceUpdate = function(weapon, ctype)
+						task.spawn(function()
+							rebuildinv()
+							saferep("CosmeticInventory")
+							saferep("WeaponInventory")
+							local selected = equip[weapon] and equip[weapon][ctype]
+							if not selected or not fctrl then return end
+							local fighter = fctrl.LocalFighter or (fctrl.GetFighter and fctrl:GetFighter(lp))
+							if not fighter then return end
+							local item
+							for _, it in pairs(fighter.Items or {}) do
+								local n = it.Name
+								pcall(function() if it.Get then n = it:Get("Name") or n end end)
+								if n == weapon then item = it; break end
+							end
+							if not item then
+								pcall(function()
+									local eq = fighter.EquippedItem
+									if eq then
+										local n = eq.Name
+										if eq.Get then n = eq:Get("Name") or n end
+										if n == weapon then item = eq end
+									end
+								end)
+							end
+							if not item then return end
+							pcall(function() if item.Set then item:Set(ctype, selected) end end)
+							pcall(function() if item.Data then item.Data[ctype] = selected end end)
+							local vm = item.ViewModel
+							if vm then
+								pcall(function() if vm.Data then vm.Data[ctype] = selected end end)
+								for _, m in ipairs({"_UpdateCosmetics","UpdateCosmetics","_RefreshViewModel","RefreshViewModel","UpdateViewModel","_UpdateSkin","UpdateSkin","_UpdateWrap","UpdateWrap"}) do
+									if type(vm[m]) == "function" then pcall(vm[m], vm) end
+								end
+							end
+							pcall(function()
+								local hotbar = fighter.FighterInterface and fighter.FighterInterface.Hotbar
+								for _, slot in pairs(hotbar and (hotbar._hotbar_slots or {}) or {}) do
+									if slot.ClientItem == item then
+										if slot._Setup then pcall(slot._Setup, slot) end
+										if slot.UpdateVisuals then pcall(slot.UpdateVisuals, slot) end
+									end
+								end
+							end)
+						end)
+					end
+
+					SkinState.Apply = function(weapon, cosmeticName, ctype)
+						ctype = ctype or "Skin"
+						if not weapon or weapon == "" then return false end
+						equip[weapon] = equip[weapon] or {}
+						if not cosmeticName or cosmeticName == "" or cosmeticName == "None" then
+							equip[weapon][ctype] = nil
+						else
+							local cloned = clonecos(cosmeticName, ctype)
+							if not cloned then return false end
+							equip[weapon][ctype] = cloned
+						end
+						rebuildinv()
+						task.defer(function()
+							saferep("CosmeticInventory")
+							saferep("WeaponInventory")
+							SkinState.ForceUpdate(weapon, ctype)
+						end)
+						pcall(function()
+							local eqrem = reps.Remotes.Data.EquipCosmetic
+							eqrem:FireServer(weapon, ctype, cosmeticName, {})
+						end)
+						return true
+					end
+
+					env._forceCosmeticUpdate = SkinState.ForceUpdate
+					env._applyCosmeticToWeapon = SkinState.Apply
+					env._harionClonecos = clonecos
+					env._harionCoss = coss
+					env._harionFctrl = fctrl
+					env._harionDctrl = dctrl
+					env._harionElib = elib
+					SkinState.Ready = true
+					env._harionSkinSystemReady = true
+					print("[anti-enhancement] Skin system ready (hookfunction/newcclosure)")
+				end)
+				if SkinState.Ready then return end
+				if attempt % 10 == 0 then
+					warn("[anti-enhancement] Skin system waiting:", errInit)
+				end
+				task.wait(0.4)
+			end
+		end)
+
+-- Damage hit notify (top-right)
+		S.hitNotifyOn = S.hitNotifyOn == true
+		task.spawn(function()
+			local parentGui = (type(gethui) == "function" and gethui()) or (player:FindFirstChild("PlayerGui"))
+			local notifyGui = Instance.new("ScreenGui")
+			notifyGui.Name = "AE_HitNotify"
+			notifyGui.ResetOnSpawn = false
+			notifyGui.IgnoreGuiInset = true
+			notifyGui.Parent = parentGui
+			local function showHitNotify(text)
+				local lbl = Instance.new("TextLabel")
+				lbl.Size = UDim2.fromOffset(420, 28)
+				lbl.Position = UDim2.new(1, -440, 0, 12)
+				lbl.BackgroundColor3 = Color3.fromRGB(18, 18, 18)
+				lbl.BackgroundTransparency = 0.25
+				lbl.BorderSizePixel = 0
+				lbl.Text = text
+				lbl.TextColor3 = Color3.fromRGB(235, 235, 235)
+				lbl.TextSize = 14
+				lbl.Font = Enum.Font.Code
+				lbl.TextXAlignment = Enum.TextXAlignment.Right
+				lbl.Parent = notifyGui
+				pcall(function()
+					local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 4); c.Parent = lbl
+				end)
+				task.delay(2.2, function()
+					pcall(function() lbl:Destroy() end)
+				end)
+			end
+			env._showHitNotify = showHitNotify
+
+			local function installHitHook()
+				local ok, err = pcall(function()
+					local fctrl = require(player.PlayerScripts.Controllers.FighterController)
+					local fighter = fctrl.LocalFighter or (fctrl.GetFighter and fctrl:GetFighter(player))
+					if not fighter then error("no fighter") end
+					local mt = getmetatable(fighter)
+					local cls = mt and mt.__index
+					if type(cls) ~= "table" or type(cls._DamageNumberEffect) ~= "function" then
+						error("no _DamageNumberEffect")
+					end
+					if env._hitNotifyHooked then return end
+					local orig = cls._DamageNumberEffect
+					cls._DamageNumberEffect = function(...)
+						local packed = table.pack(...)
+						if S.hitNotifyOn then
+							pcall(function()
+								local dmg, targetName
+								for i = 1, packed.n do
+									local v = packed[i]
+									if type(v) == "number" and v > 0 and v <= 1000 and not dmg then
+										dmg = v
+									elseif typeof(v) == "Instance" then
+										local model = v
+										while model and not model:IsA("Model") do model = model.Parent end
+										if model then
+											local plr = Players:GetPlayerFromCharacter(model)
+											if plr and plr ~= player then targetName = plr.Name end
+										end
+									elseif type(v) == "table" then
+										for _, vv in pairs(v) do
+											if type(vv) == "number" and vv > 0 and vv <= 500 and not dmg then dmg = vv end
+											if typeof(vv) == "Instance" then
+												local model = vv
+												while model and not model:IsA("Model") do model = model.Parent end
+												if model then
+													local plr = Players:GetPlayerFromCharacter(model)
+													if plr and plr ~= player then targetName = plr.Name end
+												end
+											end
+										end
+									end
+								end
+								if dmg and targetName then
+									local msg = string.format("%s님이 %s에게 %s 데미지를 입혔습니다", player.Name, targetName, tostring(math.floor(dmg + 0.5)))
+									if env._showHitNotify then env._showHitNotify(msg) end
+								end
+							end)
+						end
+						return orig(table.unpack(packed, 1, packed.n))
+					end
+					env._hitNotifyHooked = true
+					print("[anti-enhancement] Hit notify hooked")
+				end)
+				return ok
+			end
+			for _ = 1, 40 do
+				if installHitHook() then break end
+				task.wait(0.5)
+			end
+		end)
+
 		task.spawn(function()
 			for _ = 1, 40 do
 				if installWeaponHooks() then return end
@@ -1612,7 +2123,7 @@ local function _tcAddConsumer()
 		watermarkLabel.AutomaticSize = Enum.AutomaticSize.X
 		watermarkLabel.BackgroundTransparency = 1
 		watermarkLabel.RichText = true
-		watermarkLabel.Text = 'anti-enhancement v0.2.9.7 | ' .. player.Name .. ' | <font color="rgb(100,180,255)">60 FPS</font>'
+		watermarkLabel.Text = 'anti-enhancement v0.2.8.2 | ' .. player.Name .. ' | <font color="rgb(100,180,255)">60 FPS</font>'
 		watermarkLabel.TextColor3 = Color3.fromRGB(200, 200, 210)
 		watermarkLabel.TextSize = 11
 		watermarkLabel.Font = Enum.Font.Code
@@ -1630,7 +2141,7 @@ local function _tcAddConsumer()
 				frameCount = 0
 				lastFpsUpdate = now
 				if S.showWatermarkOn then
-					watermarkLabel.Text = 'anti-enhancement v0.2.9.7 | ' .. player.Name .. ' | <font color="rgb(100,180,255)">' .. currentFps .. ' FPS</font>'
+					watermarkLabel.Text = 'anti-enhancement v0.2.8.2 | ' .. player.Name .. ' | <font color="rgb(100,180,255)">' .. currentFps .. ' FPS</font>'
 				end
 			end
 		end))
@@ -1921,7 +2432,7 @@ local function _tcAddConsumer()
 		title.Size = UDim2.new(1, -20, 1, 0)
 		title.Position = UDim2.fromOffset(10, 0)
 		title.BackgroundTransparency = 1
-		title.Text = "anti enhancement v0.2.9.7- https://discord.gg/6pH3NGVtm"
+		title.Text = "anti enhancement v0.2.8.2- https://discord.gg/6pH3NGVtm"
 		title.TextColor3 = Color3.fromRGB(180, 185, 200)
 		title.TextSize = 12
 		title.Font = Enum.Font.Gotham
@@ -3542,7 +4053,7 @@ local function _tcAddConsumer()
 					pcall(function()
 						if title then title.TextColor3 = col; title.Font = font end
 						if kbTitle then
-							kbTitle.Text = '<font color="rgb(' .. math.floor(col.R*255) .. ',' .. math.floor(col.G*255) .. ',' .. math.floor(col.B*255) .. ')">Keybinds (anti enhancement v0.2.9.7)</font>'
+							kbTitle.Text = '<font color="rgb(' .. math.floor(col.R*255) .. ',' .. math.floor(col.G*255) .. ',' .. math.floor(col.B*255) .. ')">Keybinds (anti enhancement v0.2.8.2)</font>'
 							kbTitle.Font = font
 						end
 						if watermarkLabel then watermarkLabel.Font = font end
@@ -4684,65 +5195,66 @@ local function _tcAddConsumer()
 							env._harionSkinHooks = true
 						end
 
-						local function forceCosmeticUpdate(weapon, ctype)
+												local function forceCosmeticUpdate(weapon, ctype)
 							task.spawn(function()
 								rebuildinv()
 								saferep("CosmeticInventory")
 								saferep("WeaponInventory")
 								local selected = equip[weapon] and equip[weapon][ctype]
+								if not selected then return end
 								if not fctrl then return end
 								local fighter = fctrl.LocalFighter or (fctrl.GetFighter and fctrl:GetFighter(lp))
 								if not fighter then return end
 								local item
 								for _, fighterItem in pairs(fighter.Items or {}) do
-									if fighterItem.Name == weapon or (fighterItem.Get and tostring(fighterItem:Get("Name")) == weapon) then
-										item = fighterItem
-										break
-									end
+									local n = fighterItem.Name
+									pcall(function()
+										if fighterItem.Get then n = fighterItem:Get("Name") or n end
+									end)
+									if n == weapon then item = fighterItem; break end
 								end
 								if not item then
-									-- try equipped item by name
 									pcall(function()
 										local eq = fighter.EquippedItem
-										if eq and (eq.Name == weapon or (eq.Get and eq:Get("Name") == weapon)) then
-											item = eq
+										if eq then
+											local n = eq.Name
+											if eq.Get then n = eq:Get("Name") or n end
+											if n == weapon then item = eq end
 										end
 									end)
 								end
 								if not item then return end
 								pcall(function() if item.Set then item:Set(ctype, selected) end end)
 								pcall(function() if item.Data then item.Data[ctype] = selected end end)
+								pcall(function() if type(item.Get) == "function" then item:Set(ctype, selected) end end)
 								local vm = item.ViewModel
-								if vm and selected then
+								if vm then
 									pcall(function() if vm.Data then vm.Data[ctype] = selected end end)
-									for _, method in ipairs({"_UpdateCosmetics","UpdateCosmetics","_UpdateWrap","UpdateWrap","_RefreshViewModel","RefreshViewModel","UpdateViewModel"}) do
-										if vm[method] then pcall(vm[method], vm) end
+									pcall(function() if vm.Set then vm:Set(ctype, selected) end end)
+									for _, method in ipairs({"_UpdateCosmetics","UpdateCosmetics","_UpdateWrap","UpdateWrap","_RefreshViewModel","RefreshViewModel","UpdateViewModel","_UpdateSkin","UpdateSkin"}) do
+										if type(vm[method]) == "function" then pcall(vm[method], vm) end
 									end
 								end
-								for _, method in ipairs({"_UpdateCosmetics","UpdateCosmetics","UpdateViewModel"}) do
-									if item[method] then pcall(item[method], item) end
+								for _, method in ipairs({"_UpdateCosmetics","UpdateCosmetics","UpdateViewModel","_UpdateSkin","UpdateSkin"}) do
+									if type(item[method]) == "function" then pcall(item[method], item) end
 								end
 								pcall(function()
 									local hotbar = fighter.FighterInterface and fighter.FighterInterface.Hotbar
-									for _, slot in pairs(hotbar and hotbar._hotbar_slots or {}) do
-										if slot.ClientItem == item then
+									for _, slot in pairs(hotbar and (hotbar._hotbar_slots or hotbar.Slots or {})) do
+										if slot.ClientItem == item or (slot.Item and slot.Item == item) then
 											if slot._Setup then pcall(slot._Setup, slot) end
 											if slot.UpdateVisuals then pcall(slot.UpdateVisuals, slot) end
 										end
 									end
 								end)
-								-- unequip/equip cycle to force visual
-								pcall(function()
-									if fighter.EquippedItem == item and item.Unequip and item.Equip then
-										item:Unequip()
-										task.wait(0.05)
-										item:Equip(true)
-									end
-								end)
+								-- force visual by re-equip
+								-- no item Unequip/Equip (Harion only swaps ViewModel, never unequips item)
 								task.wait(0.1)
 								saferep("WeaponInventory")
+								saferep("CosmeticInventory")
 							end)
 						end
+
 
 						local function applyCosmeticToWeapon(weapon, cosmeticName, ctype)
 							if not weapon or weapon == "" then return end
@@ -4770,7 +5282,42 @@ local function _tcAddConsumer()
 							end)
 						end
 
-						if env._skinPickerGui and env._skinPickerGui.Parent then
+						
+						-- Keep skins applied on equip
+						if not env._skinEquipWatcher then
+							env._skinEquipWatcher = true
+							task.spawn(function()
+								while true do
+									task.wait(0.5)
+									local okW, errW = pcall(function()
+										local eqTable = env._harionEquip
+										if type(eqTable) ~= "table" then return end
+										if not fctrl then return end
+										local fighter = fctrl.LocalFighter or (fctrl.GetFighter and fctrl:GetFighter(lp))
+										if not fighter or not fighter.EquippedItem then return end
+										local item = fighter.EquippedItem
+										local wname = item.Name
+										pcall(function()
+											if item.Get then wname = item:Get("Name") or wname end
+										end)
+										local weq = eqTable[wname]
+										if type(weq) ~= "table" then return end
+										for ctype, selected in pairs(weq) do
+											if type(selected) == "table" then
+												pcall(function() if item.Set then item:Set(ctype, selected) end end)
+												pcall(function() if item.Data then item.Data[ctype] = selected end end)
+												local vm = item.ViewModel
+												if vm and vm.Data then
+													pcall(function() vm.Data[ctype] = selected end)
+												end
+											end
+										end
+									end)
+								end
+							end)
+						end
+
+if env._skinPickerGui and env._skinPickerGui.Parent then
 							pcall(function() env._skinPickerGui:Destroy() end)
 						end
 
@@ -4947,9 +5494,20 @@ local function _tcAddConsumer()
 									b.TextTruncate = Enum.TextTruncate.AtEnd
 									b.Parent = right
 									b.MouseButton1Click:Connect(function()
-										applyCosmeticToWeapon(weaponName, skinName, "Skin")
-										status.Text = "Applied " .. skinName .. " → " .. weaponName .. " (re-equip weapon)"
-										status.TextColor3 = Color3.fromRGB(120, 220, 140)
+										local applied = false
+										if env._applyCosmeticToWeapon then
+											applied = env._applyCosmeticToWeapon(weaponName, skinName, "Skin")
+										elseif applyCosmeticToWeapon then
+											applyCosmeticToWeapon(weaponName, skinName, "Skin")
+											applied = true
+										end
+										if applied then
+											status.Text = "Applied " .. skinName .. " → " .. weaponName .. " (re-equip if needed)"
+											status.TextColor3 = Color3.fromRGB(120, 220, 140)
+										else
+											status.Text = "Apply failed — wait for match / system ready"
+											status.TextColor3 = Color3.fromRGB(255, 180, 100)
+										end
 									end)
 									if i % 20 == 0 then task.wait() end
 								end
@@ -5020,6 +5578,55 @@ local function _tcAddConsumer()
 						allSkinStatus.TextColor3 = Color3.fromRGB(255, 120, 120)
 					end
 				end)
+			end)
+
+
+			-- Weapons (Harion-style options)
+			local gWeap = createGroupBox(mainPage, "weapons", UDim2.fromOffset(368, 220), UDim2.fromOffset(388, 8))
+			local noSpreadButton = toggle(gWeap, "no spread", UDim2.fromOffset(8, 22))
+			local fastShotButton = toggle(gWeap, "fastshoot", UDim2.fromOffset(8, 52))
+			local fastProjButton = toggle(gWeap, "fast projectile", UDim2.fromOffset(8, 82))
+			local fullAutoButton = toggle(gWeap, "full auto", UDim2.fromOffset(8, 112))
+			local backstabButton = toggle(gWeap, "always backstab", UDim2.fromOffset(8, 142))
+			setToggle(noSpreadButton, S.noSpreadOn, "no spread")
+			setToggle(fastShotButton, S.fastShotOn, "fastshoot")
+			setToggle(fastProjButton, S.fastProjectileOn, "fast projectile")
+			setToggle(fullAutoButton, S.fullAutoOn, "full auto")
+			setToggle(backstabButton, S.alwaysBackstabOn, "always backstab")
+			noSpreadButton.MouseButton1Click:Connect(function()
+				S.noSpreadOn = not S.noSpreadOn
+				setToggle(noSpreadButton, S.noSpreadOn, "no spread")
+				pcall(function() if env.installWeaponHooks then env.installWeaponHooks() end end)
+			end)
+			fastShotButton.MouseButton1Click:Connect(function()
+				S.fastShotOn = not S.fastShotOn
+				setToggle(fastShotButton, S.fastShotOn, "fastshoot")
+				pcall(function() if env.installWeaponHooks then env.installWeaponHooks() end end)
+			end)
+			fastProjButton.MouseButton1Click:Connect(function()
+				S.fastProjectileOn = not S.fastProjectileOn
+				setToggle(fastProjButton, S.fastProjectileOn, "fast projectile")
+				pcall(function() if env.installWeaponHooks then env.installWeaponHooks() end end)
+			end)
+			fullAutoButton.MouseButton1Click:Connect(function()
+				S.fullAutoOn = not S.fullAutoOn
+				setToggle(fullAutoButton, S.fullAutoOn, "full auto")
+				pcall(function() if env.installWeaponHooks then env.installWeaponHooks() end end)
+			end)
+			backstabButton.MouseButton1Click:Connect(function()
+				S.alwaysBackstabOn = not S.alwaysBackstabOn
+				setToggle(backstabButton, S.alwaysBackstabOn, "always backstab")
+				pcall(function() if env.installWeaponHooks then env.installWeaponHooks() end end)
+			end)
+
+			-- Hit damage notifier
+			local gHit = createGroupBox(mainPage, "hit notify", UDim2.fromOffset(368, 90), UDim2.fromOffset(388, 240))
+			local hitNotifyBtn = toggle(gHit, "damage notify (top right)", UDim2.fromOffset(8, 22))
+			S.hitNotifyOn = S.hitNotifyOn == true
+			setToggle(hitNotifyBtn, S.hitNotifyOn, "damage notify (top right)")
+			hitNotifyBtn.MouseButton1Click:Connect(function()
+				S.hitNotifyOn = not S.hitNotifyOn
+				setToggle(hitNotifyBtn, S.hitNotifyOn, "damage notify (top right)")
 			end)
 
 env._pageUI = {
@@ -5506,7 +6113,7 @@ env._pageUI = {
 			upLbl.Position = UDim2.fromOffset(6, -8)
 			upLbl.BackgroundColor3 = Color3.fromRGB(14, 14, 18)
 			upLbl.BackgroundTransparency = 0
-			upLbl.Text = " updates (v0.2.9.7) "
+			upLbl.Text = " updates (v0.2.8.2) "
 			upLbl.TextColor3 = Color3.fromRGB(100, 180, 255)
 			upLbl.TextSize = 12
 			upLbl.Font = Enum.Font.Code
@@ -5531,7 +6138,7 @@ env._pageUI = {
 			updateBody.Font = Enum.Font.Code
 			updateBody.TextWrapped = true
 			updateBody.Text = table.concat({
-				"v0.2.9.7",
+				"v0.2.8.2",
 				"- Silent Aim v16 (UseItem.FireServer only)",
 				"- Removed Workspace Raycast hook (C stack fix)",
 				"- ESP Rank / WS / Distance / Weapon detection",
@@ -6374,7 +6981,7 @@ env._pageUI = {
 
 		pcall(function() showPage("main") end)
 		if gui then gui.Enabled = true end
-		print("anti-enhancement v0.2.9.7 Enhanced & Loaded Successfully! (Silent Aim v7 + Skin Menu + Skybox + Triggerbot)")
+		print("anti-enhancement v0.2.8.2 Enhanced & Loaded Successfully! (Silent Aim v7 + Skin Menu + Skybox + Triggerbot)")
 	end)
 end
 
@@ -6414,7 +7021,7 @@ else
 	keyTitle.Position = UDim2.fromOffset(0, 10)
 	keyTitle.BackgroundTransparency = 1
 	keyTitle.RichText = true
-	keyTitle.Text = '<font color="rgb(100,180,255)">Anti-rival Key System (anti-enhancement v0.2.9.7)</font>'
+	keyTitle.Text = '<font color="rgb(100,180,255)">Anti-rival Key System (anti-enhancement v0.2.8.2)</font>'
 	keyTitle.TextSize, keyTitle.Font = 13, Enum.Font.Code
 	keyTitle.TextXAlignment = Enum.TextXAlignment.Center
 	keyTitle.Parent = keyFrame
