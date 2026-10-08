@@ -1,4 +1,5 @@
--- [anti-enhancement v0.2.8.2 재배포 금지]
+-- [anti-enhancement v0.2.8.4 재배포 금지 재배포 시 IP 딸거임]
+-- Early anti-kick / ClientAlert (Harion-style)
 pcall(function()
 	local lp = game:GetService("Players").LocalPlayer
 	if not lp then return end
@@ -1266,7 +1267,11 @@ local function _tcAddConsumer()
 		env.installWeaponHooks = installWeaponHooks
 
 		
-		-- ========== Harion skin system (executor APIs) ==========
+		
+		-- ========== Skin system (SAFE — no weapon wipe) ==========
+		-- Does NOT hook GetWeaponData (cloning it made weapons vanish).
+		-- Does NOT Replicate("WeaponInventory").
+		-- Does NOT Unequip items.
 		local genv = (type(getgenv) == "function" and getgenv()) or _G
 		genv._AE_Skin = genv._AE_Skin or {}
 		local SkinState = genv._AE_Skin
@@ -1282,7 +1287,6 @@ local function _tcAddConsumer()
 			end
 			return fn
 		end
-
 		local function safe_hookfunction(target, replacement)
 			if type(hookfunction) ~= "function" then return nil end
 			local ok, res = pcall(hookfunction, target, replacement)
@@ -1300,15 +1304,14 @@ local function _tcAddConsumer()
 					local lp = player
 					local reps = ReplicatedStorage
 					local modules = reps:FindFirstChild("Modules")
-					if not modules then error("Modules missing — join match") end
+					if not modules then error("Modules missing") end
 
-					local elib, clib, ilib, dctrl, fctrl, citem
+					local elib, clib, dctrl, fctrl
 					pcall(function() elib = require(modules:FindFirstChild("EnumLibrary") or modules.EnumLibrary) end)
 					pcall(function()
 						if elib and elib.WaitForEnumBuilder then elib:WaitForEnumBuilder() end
 					end)
 					pcall(function() clib = require(modules:FindFirstChild("CosmeticLibrary") or modules.CosmeticLibrary) end)
-					pcall(function() ilib = require(modules:FindFirstChild("ItemLibrary") or modules.ItemLibrary) end)
 					pcall(function()
 						local ps = lp:FindFirstChild("PlayerScripts") or lp:WaitForChild("PlayerScripts", 2)
 						local ctrls = ps and (ps:FindFirstChild("Controllers") or ps:WaitForChild("Controllers", 2))
@@ -1316,13 +1319,8 @@ local function _tcAddConsumer()
 							pcall(function() dctrl = require(ctrls:FindFirstChild("PlayerDataController") or ctrls.PlayerDataController) end)
 							pcall(function() fctrl = require(ctrls:FindFirstChild("FighterController") or ctrls.FighterController) end)
 						end
-						pcall(function()
-							citem = require(ps.Modules.ClientReplicatedClasses.ClientFighter.ClientItem)
-						end)
 					end)
-
-					if not clib or type(clib.Cosmetics) ~= "table" then error("CosmeticLibrary not ready") end
-					if not dctrl then error("PlayerDataController not ready") end
+					if not clib or type(clib.Cosmetics) ~= "table" then error("no CosmeticLibrary") end
 
 					local equip = SkinState.equip
 					local finv = SkinState.finv
@@ -1337,7 +1335,7 @@ local function _tcAddConsumer()
 						local s, id = pcall(elib.ToEnum, elib, n)
 						return s and id or nil
 					end
-					local function clonecos(name, ctype, inv, favonly)
+					local function clonecos(name, ctype)
 						if banned(name) then return nil end
 						local base = coss[name]
 						if not base then return nil end
@@ -1349,12 +1347,8 @@ local function _tcAddConsumer()
 						d.Owned = true
 						d.Unlocked = true
 						d.Locked = false
-						d.Amount = math.max(1, tonumber(d.Amount) or 1)
-						d.Count = math.max(1, tonumber(d.Count) or 1)
 						local eid = toenum(name)
 						if eid then d.Enum = eid; d.ObjectID = d.ObjectID or eid end
-						if inv ~= nil then d.Inverted = inv end
-						if favonly ~= nil then d.OnlyUseFavorites = favonly end
 						return d
 					end
 					local function rebuildinv()
@@ -1369,14 +1363,16 @@ local function _tcAddConsumer()
 							end
 						end
 					end
-					local function saferep(key)
+					local function saferepCosmetic()
 						pcall(function()
-							local cdata = dctrl.CurrentData
-							if cdata and cdata.Replicate then cdata:Replicate(key) end
+							local cdata = dctrl and dctrl.CurrentData
+							if cdata and cdata.Replicate then
+								cdata:Replicate("CosmeticInventory")
+							end
 						end)
 					end
 
-					-- OwnsCosmetic always true (Harion)
+					-- Unlock cosmetics only (safe)
 					pcall(function()
 						clib.OwnsCosmetic = safe_newcclosure(function() return true end)
 						clib.OwnsCosmeticNormally = safe_newcclosure(function() return true end)
@@ -1384,8 +1380,8 @@ local function _tcAddConsumer()
 						clib.OwnsCosmeticForWeapon = safe_newcclosure(function() return true end)
 					end)
 
-					-- dctrl.Get → CosmeticInventory inject
-					if not SkinState.GetHooked and type(dctrl.Get) == "function" then
+					-- CosmeticInventory inject only — never touch WeaponInventory / GetWeaponData
+					if dctrl and type(dctrl.Get) == "function" and not SkinState.GetHooked then
 						local oget = dctrl.Get
 						local hookedGet = safe_newcclosure(function(self, key)
 							local data = oget(self, key)
@@ -1406,41 +1402,11 @@ local function _tcAddConsumer()
 							return data
 						end)
 						local hf = safe_hookfunction(dctrl.Get, hookedGet)
-						if hf then
-							oget = hf
-						else
-							dctrl.Get = hookedGet
-						end
+						if hf then oget = hf else dctrl.Get = hookedGet end
 						SkinState.GetHooked = true
 					end
 
-					-- GetWeaponData merge
-					if not SkinState.WDHooked and type(dctrl.GetWeaponData) == "function" then
-						local ogetwep = dctrl.GetWeaponData
-						local hookedWD = safe_newcclosure(function(self, wname)
-							local data = ogetwep(self, wname)
-							if not data then return nil end
-							local merged = {}
-							for k, v in pairs(data) do merged[k] = v end
-							merged.Name = wname
-							local weq = equip[wname]
-							if type(weq) == "table" then
-								for ct, cd in pairs(weq) do
-									if type(cd) == "table" then merged[ct] = cd end
-								end
-							end
-							return merged
-						end)
-						local hf = safe_hookfunction(dctrl.GetWeaponData, hookedWD)
-						if hf then
-							ogetwep = hf
-						else
-							dctrl.GetWeaponData = hookedWD
-						end
-						SkinState.WDHooked = true
-					end
-
-					-- EquipCosmetic FireServer intercept (Harion style)
+					-- EquipCosmetic: record client equip, ALWAYS pass through to original (never drop FireServer)
 					if not SkinState.EqHooked then
 						pcall(function()
 							local rems = reps:FindFirstChild("Remotes")
@@ -1451,129 +1417,44 @@ local function _tcAddConsumer()
 							local intercept = safe_newcclosure(function(self, ...)
 								local args = { ... }
 								if self == eqrem then
-									local wname, ctype, cname, opts = args[1], args[2], args[3], args[4]
-									if type(wname) == "string" and type(ctype) == "string" then
-										if not cname or cname == "None" or cname == "" then
+									local wname, ctype, cname = args[1], args[2], args[3]
+									if type(wname) == "string" and type(ctype) == "string" and type(cname) == "string" then
+										if cname ~= "" and cname ~= "None" and not banned(cname) then
 											equip[wname] = equip[wname] or {}
-											equip[wname][ctype] = nil
-											if equip[wname] and not next(equip[wname]) then equip[wname] = nil end
+											local cloned = clonecos(cname, ctype)
+											if cloned then equip[wname][ctype] = cloned end
 											rebuildinv()
-											task.defer(function() saferep("WeaponInventory") end)
-											return oldFire(self, ...)
+											task.defer(saferepCosmetic)
+										elseif cname == "" or cname == "None" then
+											if equip[wname] then
+												equip[wname][ctype] = nil
+												if not next(equip[wname]) then equip[wname] = nil end
+											end
+											rebuildinv()
 										end
-										if banned(cname) then return oldFire(self, ...) end
-										-- if already owned for real, let server handle
-										local owned = false
-										pcall(function()
-											local inv = dctrl:Get("CosmeticInventory")
-											if type(inv) == "table" and type(inv[cname]) == "table" then owned = true end
-										end)
-										equip[wname] = equip[wname] or {}
-										local cloned = clonecos(cname, ctype, type(opts) == "table" and opts.IsInverted or nil, type(opts) == "table" and opts.OnlyUseFavorites or nil)
-										if cloned then equip[wname][ctype] = cloned end
-										rebuildinv()
-										task.defer(function()
-											saferep("CosmeticInventory")
-											saferep("WeaponInventory")
-											if SkinState.ForceUpdate then SkinState.ForceUpdate(wname, ctype) end
-										end)
-										if owned then
-											return oldFire(self, ...)
-										end
-										-- unowned: client-only (Harion returns without FireServer)
-										return
 									end
 								end
+								-- ALWAYS call original — blocking FireServer was desyncing weapons
 								return oldFire(self, ...)
 							end)
 							local hf = safe_hookfunction(eqrem.FireServer, intercept)
-							if hf then
-								oldFire = hf
-							else
-								eqrem.FireServer = intercept
-							end
+							if hf then oldFire = hf else eqrem.FireServer = intercept end
 							SkinState.EqHooked = true
 						end)
 					end
 
-					-- ClientItem._CreateViewModel inject Skin
-					if citem and type(citem._CreateViewModel) == "function" and not SkinState.CVMHooked then
-						local ocvm = citem._CreateViewModel
-						local hookedCVM = safe_newcclosure(function(self, vmref)
-							local wname = self.Name
-							local wplr = self.ClientFighter and self.ClientFighter.Player
-							if wplr == lp and type(equip[wname]) == "table" and type(vmref) == "table" then
-								local cos = equip[wname]
-								pcall(function()
-									local data = vmref.Data
-									if type(data) ~= "table" and type(self.ToEnum) == "function" then
-										local dk = self:ToEnum("Data")
-										if dk and type(vmref[dk]) == "table" then data = vmref[dk] end
-									end
-									if type(data) == "table" then
-										if cos.Skin then
-											data.Skin = cos.Skin
-											pcall(function()
-												if self.ToEnum then
-													local sk = self:ToEnum("Skin")
-													if sk ~= nil then data[sk] = cos.Skin end
-												end
-											end)
-										end
-										if cos.Wrap then data.Wrap = cos.Wrap end
-										if cos.Charm then data.Charm = cos.Charm end
-									end
-								end)
-							end
-							return ocvm(self, vmref)
-						end)
-						local hf = safe_hookfunction(citem._CreateViewModel, hookedCVM)
-						if hf then
-							ocvm = hf
-						else
-							citem._CreateViewModel = hookedCVM
-						end
-						SkinState.CVMHooked = true
-					end
-
-					-- ClientItem.Get Skin override
-					if citem and type(citem.Get) == "function" and not SkinState.ItemGetHooked then
-						local ogetItem = citem.Get
-						local hookedGet = safe_newcclosure(function(self, key)
-							local wplr = self.ClientFighter and self.ClientFighter.Player
-							if wplr == lp then
-								local weq = equip[self.Name]
-								if type(weq) == "table" then
-									if (key == "Skin" or tostring(key) == "Skin") and weq.Skin then return weq.Skin end
-									if (key == "Wrap" or tostring(key) == "Wrap") and weq.Wrap then return weq.Wrap end
-									if (key == "Charm" or tostring(key) == "Charm") and weq.Charm then return weq.Charm end
-								end
-							end
-							return ogetItem(self, key)
-						end)
-						local hf = safe_hookfunction(citem.Get, hookedGet)
-						if hf then
-							ogetItem = hf
-						else
-							citem.Get = hookedGet
-						end
-						SkinState.ItemGetHooked = true
-					end
-
-					-- ForceUpdate: Set only, never Unequip item
 					SkinState.ForceUpdate = function(weapon, ctype)
 						task.spawn(function()
-							rebuildinv()
-							saferep("CosmeticInventory")
-							saferep("WeaponInventory")
 							local selected = equip[weapon] and equip[weapon][ctype]
-							if not selected or not fctrl then return end
+							if type(selected) ~= "table" or not fctrl then return end
 							local fighter = fctrl.LocalFighter or (fctrl.GetFighter and fctrl:GetFighter(lp))
 							if not fighter then return end
 							local item
 							for _, it in pairs(fighter.Items or {}) do
 								local n = it.Name
-								pcall(function() if it.Get then n = it:Get("Name") or n end end)
+								pcall(function()
+									if type(it.Get) == "function" then n = it:Get("Name") or n end
+								end)
 								if n == weapon then item = it; break end
 							end
 							if not item then
@@ -1581,30 +1462,27 @@ local function _tcAddConsumer()
 									local eq = fighter.EquippedItem
 									if eq then
 										local n = eq.Name
-										if eq.Get then n = eq:Get("Name") or n end
+										if type(eq.Get) == "function" then n = eq:Get("Name") or n end
 										if n == weapon then item = eq end
 									end
 								end)
 							end
 							if not item then return end
-							pcall(function() if item.Set then item:Set(ctype, selected) end end)
-							pcall(function() if item.Data then item.Data[ctype] = selected end end)
+							pcall(function()
+								if type(item.Set) == "function" then item:Set(ctype, selected) end
+							end)
+							pcall(function()
+								if type(item.Data) == "table" then item.Data[ctype] = selected end
+							end)
 							local vm = item.ViewModel
-							if vm then
-								pcall(function() if vm.Data then vm.Data[ctype] = selected end end)
-								for _, m in ipairs({"_UpdateCosmetics","UpdateCosmetics","_RefreshViewModel","RefreshViewModel","UpdateViewModel","_UpdateSkin","UpdateSkin","_UpdateWrap","UpdateWrap"}) do
+							if type(vm) == "table" then
+								pcall(function()
+									if type(vm.Data) == "table" then vm.Data[ctype] = selected end
+								end)
+								for _, m in ipairs({"_UpdateCosmetics", "UpdateCosmetics", "UpdateSkin", "_UpdateSkin"}) do
 									if type(vm[m]) == "function" then pcall(vm[m], vm) end
 								end
 							end
-							pcall(function()
-								local hotbar = fighter.FighterInterface and fighter.FighterInterface.Hotbar
-								for _, slot in pairs(hotbar and (hotbar._hotbar_slots or {}) or {}) do
-									if slot.ClientItem == item then
-										if slot._Setup then pcall(slot._Setup, slot) end
-										if slot.UpdateVisuals then pcall(slot.UpdateVisuals, slot) end
-									end
-								end
-							end)
 						end)
 					end
 
@@ -1614,6 +1492,7 @@ local function _tcAddConsumer()
 						equip[weapon] = equip[weapon] or {}
 						if not cosmeticName or cosmeticName == "" or cosmeticName == "None" then
 							equip[weapon][ctype] = nil
+							if equip[weapon] and not next(equip[weapon]) then equip[weapon] = nil end
 						else
 							local cloned = clonecos(cosmeticName, ctype)
 							if not cloned then return false end
@@ -1621,13 +1500,16 @@ local function _tcAddConsumer()
 						end
 						rebuildinv()
 						task.defer(function()
-							saferep("CosmeticInventory")
-							saferep("WeaponInventory")
+							saferepCosmetic()
 							SkinState.ForceUpdate(weapon, ctype)
 						end)
 						pcall(function()
-							local eqrem = reps.Remotes.Data.EquipCosmetic
-							eqrem:FireServer(weapon, ctype, cosmeticName, {})
+							local rems = reps:FindFirstChild("Remotes")
+							local drems = rems and rems:FindFirstChild("Data")
+							local eqrem = drems and drems:FindFirstChild("EquipCosmetic")
+							if eqrem then
+								eqrem:FireServer(weapon, ctype, cosmeticName, {})
+							end
 						end)
 						return true
 					end
@@ -1638,14 +1520,13 @@ local function _tcAddConsumer()
 					env._harionCoss = coss
 					env._harionFctrl = fctrl
 					env._harionDctrl = dctrl
-					env._harionElib = elib
 					SkinState.Ready = true
 					env._harionSkinSystemReady = true
-					print("[anti-enhancement] Skin system ready (hookfunction/newcclosure)")
+					print("[anti-enhancement] Skin system ready (safe mode — no GetWeaponData hook)")
 				end)
 				if SkinState.Ready then return end
 				if attempt % 10 == 0 then
-					warn("[anti-enhancement] Skin system waiting:", errInit)
+					warn("[anti-enhancement] Skin waiting:", errInit)
 				end
 				task.wait(0.4)
 			end
@@ -2123,7 +2004,7 @@ local function _tcAddConsumer()
 		watermarkLabel.AutomaticSize = Enum.AutomaticSize.X
 		watermarkLabel.BackgroundTransparency = 1
 		watermarkLabel.RichText = true
-		watermarkLabel.Text = 'anti-enhancement v0.2.8.2 | ' .. player.Name .. ' | <font color="rgb(100,180,255)">60 FPS</font>'
+		watermarkLabel.Text = 'anti-enhancement v0.2.8.4 | ' .. player.Name .. ' | <font color="rgb(100,180,255)">60 FPS</font>'
 		watermarkLabel.TextColor3 = Color3.fromRGB(200, 200, 210)
 		watermarkLabel.TextSize = 11
 		watermarkLabel.Font = Enum.Font.Code
@@ -2141,7 +2022,7 @@ local function _tcAddConsumer()
 				frameCount = 0
 				lastFpsUpdate = now
 				if S.showWatermarkOn then
-					watermarkLabel.Text = 'anti-enhancement v0.2.8.2 | ' .. player.Name .. ' | <font color="rgb(100,180,255)">' .. currentFps .. ' FPS</font>'
+					watermarkLabel.Text = 'anti-enhancement v0.2.8.4 | ' .. player.Name .. ' | <font color="rgb(100,180,255)">' .. currentFps .. ' FPS</font>'
 				end
 			end
 		end))
@@ -2432,7 +2313,7 @@ local function _tcAddConsumer()
 		title.Size = UDim2.new(1, -20, 1, 0)
 		title.Position = UDim2.fromOffset(10, 0)
 		title.BackgroundTransparency = 1
-		title.Text = "anti enhancement v0.2.8.2- https://discord.gg/6pH3NGVtm"
+		title.Text = "anti enhancement v0.2.8.4- https://discord.gg/6pH3NGVtm"
 		title.TextColor3 = Color3.fromRGB(180, 185, 200)
 		title.TextSize = 12
 		title.Font = Enum.Font.Gotham
@@ -4053,7 +3934,7 @@ local function _tcAddConsumer()
 					pcall(function()
 						if title then title.TextColor3 = col; title.Font = font end
 						if kbTitle then
-							kbTitle.Text = '<font color="rgb(' .. math.floor(col.R*255) .. ',' .. math.floor(col.G*255) .. ',' .. math.floor(col.B*255) .. ')">Keybinds (anti enhancement v0.2.8.2)</font>'
+							kbTitle.Text = '<font color="rgb(' .. math.floor(col.R*255) .. ',' .. math.floor(col.G*255) .. ',' .. math.floor(col.B*255) .. ')">Keybinds (anti enhancement v0.2.8.4)</font>'
 							kbTitle.Font = font
 						end
 						if watermarkLabel then watermarkLabel.Font = font end
@@ -4656,126 +4537,9 @@ local function _tcAddConsumer()
 						return data
 					end
 
-					local originalGetWeaponData = DataController.GetWeaponData
-					local inWD = false
-					DataController.GetWeaponData = function(self, weaponName)
-						if inWD then
-							return originalGetWeaponData(self, weaponName)
-						end
-						inWD = true
-						local okD, data = pcall(originalGetWeaponData, self, weaponName)
-						inWD = false
-						if not okD or type(data) ~= "table" then
-							return data
-						end
-						local merged = {}
-						for k, v in pairs(data) do
-							merged[k] = v
-						end
-						if type(weaponName) == "string" then
-							merged.Name = weaponName
-							local eq = equipped[weaponName]
-							if type(eq) == "table" then
-								for ct, cd in pairs(eq) do
-									if type(ct) == "string" and type(cd) == "table" and cd.Name then
-										merged[ct] = cd
-									end
-								end
-							end
-						end
-						return merged
-					end
+					-- GetWeaponData NOT hooked (prevents weapon wipe)
 
-					-- Equip intercept only (no kick/shutdown/game-wide blocks)
-					pcall(function()
-						if not hookmetamethod or not newcclosure or env._allSkinsEquipHooked then
-							return
-						end
-						local remotes = ReplicatedStorage:FindFirstChild("Remotes")
-						local dataRemotes = remotes and remotes:FindFirstChild("Data")
-						local equipRemote = dataRemotes and dataRemotes:FindFirstChild("EquipCosmetic")
-						local favoriteRemote = dataRemotes and dataRemotes:FindFirstChild("FavoriteCosmetic")
-						if not equipRemote then
-							return
-						end
-						env._allSkinsEquipHooked = true
-						local oldNamecall
-						local busy = false
-						oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
-							if busy then
-								return oldNamecall(self, ...)
-							end
-							if getnamecallmethod() ~= "FireServer" then
-								return oldNamecall(self, ...)
-							end
-							if self ~= equipRemote and self ~= favoriteRemote then
-								return oldNamecall(self, ...)
-							end
-							busy = true
-							local args = { ... }
-							if self == equipRemote then
-								local weaponName, cosmeticType, cosmeticName, options = args[1], args[2], args[3], args[4]
-								if type(options) ~= "table" then
-									options = {}
-								end
-								if type(weaponName) == "string" and type(cosmeticType) == "string" then
-									if type(cosmeticName) == "string" and cosmeticName ~= "" and cosmeticName ~= "None" then
-										local trulyOwned = false
-										pcall(function()
-											local inv = originalGet(DataController, "CosmeticInventory")
-											if type(inv) == "table" and rawget(inv, cosmeticName) then
-												trulyOwned = true
-											end
-										end)
-										equipped[weaponName] = equipped[weaponName] or {}
-										local cloned = cloneCosmetic(cosmeticName, cosmeticType, {
-											inverted = options.IsInverted,
-											favoritesOnly = options.OnlyUseFavorites,
-										})
-										if cloned then
-											equipped[weaponName][cosmeticType] = cloned
-										end
-										task.defer(function()
-											pcall(function()
-												if DataController.CurrentData and DataController.CurrentData.Replicate then
-													DataController.CurrentData:Replicate("WeaponInventory")
-												end
-											end)
-											saveConfig()
-										end)
-										if trulyOwned then
-											local r = oldNamecall(self, ...)
-											busy = false
-											return r
-										end
-										busy = false
-										return
-									else
-										if equipped[weaponName] then
-											equipped[weaponName][cosmeticType] = nil
-											if not next(equipped[weaponName]) then
-												equipped[weaponName] = nil
-											end
-										end
-										task.defer(saveConfig)
-									end
-								end
-							elseif self == favoriteRemote then
-								local w, n, fav = args[1], args[2], args[3]
-								if type(w) == "string" and type(n) == "string" then
-									favorites[w] = favorites[w] or {}
-									favorites[w][n] = fav or nil
-									env._allSkinsFavorites = favorites
-									task.defer(saveConfig)
-									busy = false
-									return
-								end
-							end
-							local r = oldNamecall(self, ...)
-							busy = false
-							return r
-						end))
-					end)
+										-- Equip namecall intercept REMOVED (was Replicating WeaponInventory / wiping weapons)
 
 					-- ViewModel apply
 					pcall(function()
@@ -5172,25 +4936,7 @@ local function _tcAddConsumer()
 										end
 									end
 								end)
-								pcall(function()
-									local ogetwep = dctrl.GetWeaponData
-									if type(ogetwep) == "function" then
-										dctrl.GetWeaponData = function(self, wname)
-											local data = ogetwep(self, wname)
-											if not data then return nil end
-											local merged = {}
-											for k, v in pairs(data) do merged[k] = v end
-											merged.Name = wname
-											local weq = equip[wname]
-											if type(weq) == "table" then
-												for ct, cd in pairs(weq) do
-													if type(cd) == "table" then merged[ct] = cd end
-												end
-											end
-											return merged
-										end
-									end
-								end)
+								-- GetWeaponData not re-hooked
 							end
 							env._harionSkinHooks = true
 						end
@@ -5199,9 +4945,8 @@ local function _tcAddConsumer()
 							task.spawn(function()
 								rebuildinv()
 								saferep("CosmeticInventory")
-								saferep("WeaponInventory")
 								local selected = equip[weapon] and equip[weapon][ctype]
-								if not selected then return end
+								if type(selected) ~= "table" then return end
 								if not fctrl then return end
 								local fighter = fctrl.LocalFighter or (fctrl.GetFighter and fctrl:GetFighter(lp))
 								if not fighter then return end
@@ -5250,7 +4995,7 @@ local function _tcAddConsumer()
 								-- force visual by re-equip
 								-- no item Unequip/Equip (Harion only swaps ViewModel, never unequips item)
 								task.wait(0.1)
-								saferep("WeaponInventory")
+								-- saferep("WeaponInventory") -- disabled
 								saferep("CosmeticInventory")
 							end)
 						end
@@ -5269,7 +5014,7 @@ local function _tcAddConsumer()
 							rebuildinv()
 							task.defer(function()
 								saferep("CosmeticInventory")
-								saferep("WeaponInventory")
+								-- saferep("WeaponInventory") -- disabled
 								forceCosmeticUpdate(weapon, ctype)
 							end)
 							pcall(function()
@@ -6113,7 +5858,7 @@ env._pageUI = {
 			upLbl.Position = UDim2.fromOffset(6, -8)
 			upLbl.BackgroundColor3 = Color3.fromRGB(14, 14, 18)
 			upLbl.BackgroundTransparency = 0
-			upLbl.Text = " updates (v0.2.8.2) "
+			upLbl.Text = " updates (v0.2.8.4) "
 			upLbl.TextColor3 = Color3.fromRGB(100, 180, 255)
 			upLbl.TextSize = 12
 			upLbl.Font = Enum.Font.Code
@@ -6138,7 +5883,7 @@ env._pageUI = {
 			updateBody.Font = Enum.Font.Code
 			updateBody.TextWrapped = true
 			updateBody.Text = table.concat({
-				"v0.2.8.2",
+				"v0.2.8.4",
 				"- Silent Aim v16 (UseItem.FireServer only)",
 				"- Removed Workspace Raycast hook (C stack fix)",
 				"- ESP Rank / WS / Distance / Weapon detection",
@@ -6981,7 +6726,7 @@ env._pageUI = {
 
 		pcall(function() showPage("main") end)
 		if gui then gui.Enabled = true end
-		print("anti-enhancement v0.2.8.2 Enhanced & Loaded Successfully! (Silent Aim v7 + Skin Menu + Skybox + Triggerbot)")
+		print("anti-enhancement v0.2.8.4 Enhanced & Loaded Successfully! (Silent Aim v7 + Skin Menu + Skybox + Triggerbot)")
 	end)
 end
 
@@ -7021,7 +6766,7 @@ else
 	keyTitle.Position = UDim2.fromOffset(0, 10)
 	keyTitle.BackgroundTransparency = 1
 	keyTitle.RichText = true
-	keyTitle.Text = '<font color="rgb(100,180,255)">Anti-rival Key System (anti-enhancement v0.2.8.2)</font>'
+	keyTitle.Text = '<font color="rgb(100,180,255)">Anti-rival Key System (anti-enhancement v0.2.8.4)</font>'
 	keyTitle.TextSize, keyTitle.Font = 13, Enum.Font.Code
 	keyTitle.TextXAlignment = Enum.TextXAlignment.Center
 	keyTitle.Parent = keyFrame
