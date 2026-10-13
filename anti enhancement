@@ -1,5 +1,4 @@
--- [anti-enhancement v0.2.8.5 재배포 금지 재배포 시 IP 딸거임]
--- Early anti-kick / ClientAlert (Harion-style)
+-- [anti-enhancement v0.2.8.6 재배포 금지]
 pcall(function()
 	local lp = game:GetService("Players").LocalPlayer
 	if not lp then return end
@@ -135,15 +134,16 @@ local function initMainScript()
 			walkOn = false, fightOn = false, espOn = false, namesOn = false, healthOn = false, noclipOn = false,
 			aimbotOn = false, aimbotStrength = 40, aimbotSmooth = 50, aimbotHitPart = "Both", silentAimOn = false, silentAimFOV = 350,
 			silentAimTargetMode = "Players", silentAimHitPart = "Body",
-			ragebotOn = false, ragebotStability = 0.15, ragebotShootFrames = 1, antiKatanaOn = false,
+			ragebotOn = false, ragebotStability = 0, ragebotShootFrames = 3, antiKatanaOn = false,
 			noSpreadOn = false, fastShotOn = false, fastProjectileOn = false, fullAutoOn = false, alwaysBackstabOn = false, fireRatePct = 100,
 			auraOn = false, triggerBotOn = false, wallbangOn = false,
+			hitNotifyOn = false, hitNotifierOn = false, speedOn = false,
 			godModeOn = false, orbitOn = false, voidSpanOn = false, infiniteJumpOn = false,
 			forceThirdPersonOn = false, teleporterOn = false, lastTeleportTick = 0, teleportDistance = 50000,
 			walkSpeed = 16, fightSpeed = 50, showKeybindsOn = true, showWatermarkOn = true,
 			autoLoad = false,
 			espEnemyName = true, espEnemyDistance = false, espEnemyRank = false, espEnemyWinstreak = false,
-			espEnemyHealth = true, espNumberEnemy = false, espHeldWeapon = false, espEnemyDeflecting = false,
+			espEnemyHealth = true, espNumberEnemy = false, espEnemyDeflecting = false, espGeometry = false, espTracer = false, espSkeleton = false, skyboxName = "", espHeldWeapon = false, espEnemyDeflecting = false,
 			espGeometry = false, espEnemyBox = true,
 			espColorName = {255,255,255}, espColorHealth = {255,176,176}, espColorDistance = {144,255,160},
 			espColorRank = {192,192,255}, espColorWinstreak = {255,224,128}, espColorWeapon = {144,255,160},
@@ -616,26 +616,65 @@ local function initMainScript()
 			return nil
 		end
 
-		-- Harion buildManipulationCameraData (exact structure)
+		-- Kicia/Harion camera manipulate (nested + flat payloads)
 		local function buildManipulationCameraData(fromPos, part)
 			if not _saUtil or not part then return nil end
 			local aimPosition = part.Position
 			pcall(function()
 				local vel = part.AssemblyLinearVelocity or part.Velocity
-				if typeof(vel) == "Vector3" and vel.Magnitude > 1 then
-					local lead = math.clamp(vel.Magnitude / 350, 0, 0.12)
+				if typeof(vel) == "Vector3" and vel.Magnitude > 0.5 then
+					-- stronger lead for rage (Kicia-style prediction)
+					local lead = math.clamp(vel.Magnitude / 280, 0, 0.22)
 					aimPosition = part.Position + vel * lead
 				end
 			end)
-			local look = CFrame.new(fromPos, aimPosition)
-			local data = {}
-			data[utf8.char(1)] = {
+			local look = CFrame.lookAt(fromPos, aimPosition)
+			local flat = {
 				[utf8.char(0)] = _saUtil:EncodeCFrame(look),
 				[utf8.char(1)] = _saUtil:EncodeCFrame(look),
 				[utf8.char(2)] = part,
 				[utf8.char(3)] = _saUtil:EncodeCFrame(part.CFrame:ToObjectSpace(CFrame.new(aimPosition))),
 			}
+			-- nested form (Harion) + expose flat for callers that need it
+			local data = {
+				[utf8.char(1)] = flat,
+				[utf8.char(2)] = true, -- no-spread / raycast flag when supported
+			}
+			data._flat = flat
 			return data
+		end
+
+		local function injectRageIntoCameraData(cameradata, fromPos, part)
+			if not _saUtil or not part then return cameradata end
+			local aimPosition = part.Position
+			pcall(function()
+				local vel = part.AssemblyLinearVelocity or part.Velocity
+				if typeof(vel) == "Vector3" and vel.Magnitude > 0.5 then
+					aimPosition = part.Position + vel * math.clamp(vel.Magnitude / 280, 0, 0.22)
+				end
+			end)
+			local look = CFrame.lookAt(fromPos, aimPosition)
+			local enc0 = _saUtil:EncodeCFrame(look)
+			local enc1 = enc0
+			local enc3 = _saUtil:EncodeCFrame(part.CFrame:ToObjectSpace(CFrame.new(aimPosition)))
+			local function fill(t)
+				if type(t) ~= "table" then return end
+				t[utf8.char(0)] = enc0
+				t[utf8.char(1)] = enc1
+				t[utf8.char(2)] = part
+				t[utf8.char(3)] = enc3
+			end
+			if type(cameradata) ~= "table" then
+				return buildManipulationCameraData(fromPos, part)
+			end
+			-- mutate existing payload in place (Kicia mutates Args["\1"])
+			if type(cameradata[utf8.char(1)]) == "table" then
+				fill(cameradata[utf8.char(1)])
+				cameradata[utf8.char(2)] = true
+			else
+				fill(cameradata)
+			end
+			return cameradata
 		end
 
 		local function saInstallHook()
@@ -650,12 +689,12 @@ local function initMainScript()
 				startShoot = _saEnums:ToEnum("StartShooting")
 			end)
 
-			-- Ragebot target: closest living enemy (large range, no FOV)
+			-- Kicia-style rage target: closest enemy head, huge range, health prioritization
 			local function rageGetTargetPart()
 				local myChar = player.Character
 				local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
 				if not myRoot then return nil, nil end
-				local closest, closestPart, closestDist = nil, nil, 2500
+				local closest, closestPart, bestScore = nil, nil, -math.huge
 				local myTeam = player:GetAttribute("TeamID") or player.Team
 				for _, plr in ipairs(Players:GetPlayers()) do
 					if plr == player then continue end
@@ -673,19 +712,23 @@ local function initMainScript()
 					local root = char:FindFirstChild("HumanoidRootPart")
 					if not part or not root then continue end
 					local dist = (myRoot.Position - root.Position).Magnitude
-					if dist < closestDist then
-						closestDist = dist
+					if dist > 4000 then continue end
+					-- score: closer + lower HP preferred (Kicia UtilizeHealthLead-ish)
+					local score = (4000 - dist) + (100 - math.clamp(hum.Health, 0, 100)) * 2
+					if score > bestScore then
+						bestScore = score
 						closest = char
 						closestPart = part
 					end
 				end
+				env._rageTargetPart = closestPart
+				env._rageTargetChar = closest
 				return closest, closestPart
 			end
 
 			local ok, err = pcall(function()
 				local old
 				old = hookfunction(useItem.FireServer, newcclosure(function(self, obj, action, cameradata, ...)
-					-- Ragebot OR Silent Aim: redirect StartShooting camera data (Harion style)
 					local wantRage = S.ragebotOn == true
 					local wantSilent = S.silentAimOn == true
 					local isShoot = (startShoot ~= nil and action == startShoot)
@@ -694,7 +737,6 @@ local function initMainScript()
 					if (wantRage or wantSilent) and isShoot then
 						local target, part
 						if wantRage then
-							-- rage has priority: always closest enemy
 							target, part = rageGetTargetPart()
 						else
 							target, part = saGetTarget()
@@ -702,7 +744,11 @@ local function initMainScript()
 						if target and part then
 							local cam = Workspace.CurrentCamera
 							local fromPos = (cam and cam.CFrame.Position) or part.Position
-							local newData = buildManipulationCameraData(fromPos, part)
+							-- Kicia mutates in place when possible
+							local newData = injectRageIntoCameraData(cameradata, fromPos, part)
+							if not newData then
+								newData = buildManipulationCameraData(fromPos, part)
+							end
 							if newData then
 								return old(self, obj, action, newData, ...)
 							end
@@ -715,10 +761,58 @@ local function initMainScript()
 
 			if ok then
 				_saHookInstalled = true
-				return true
+			else
+				warn("[Silent Aim] hookfunction failed:", err)
 			end
-			warn("[Silent Aim] hook failed:", err)
-			return false
+			-- Fallback: __namecall FireServer intercept (Kicia-style dual path)
+			if not env._saNamecallHooked and getrawmetatable and setreadonly and newcclosure and getnamecallmethod then
+				pcall(function()
+					local mt = getrawmetatable(game)
+					local oldnc = mt.__namecall
+					setreadonly(mt, false)
+					mt.__namecall = newcclosure(function(self, ...)
+						local method = getnamecallmethod()
+						if method == "FireServer" and (S.ragebotOn or S.silentAimOn) then
+							local args = {...}
+							local action = args[2]
+							local isShoot = (startShoot ~= nil and action == startShoot)
+								or action == "StartShooting"
+								or (type(action) == "string" and tostring(action):lower():find("startshoot", 1, true) ~= nil)
+							-- UseItem remote check by name
+							local isUseItem = false
+							pcall(function()
+								isUseItem = self.Name == "UseItem" or (tostring(self):find("UseItem") ~= nil)
+							end)
+							if isUseItem and isShoot then
+								local part = nil
+								if S.ragebotOn then
+									local _, p = rageGetTargetPart()
+									part = p
+								else
+									local _, p = saGetTarget()
+									part = p
+								end
+								if part then
+									local cam = Workspace.CurrentCamera
+									local fromPos = (cam and cam.CFrame.Position) or part.Position
+									local newData = injectRageIntoCameraData(args[3], fromPos, part)
+										or buildManipulationCameraData(fromPos, part)
+									if newData then
+										args[3] = newData
+										return oldnc(self, table.unpack(args))
+									end
+								end
+							end
+						end
+						return oldnc(self, ...)
+					end)
+					setreadonly(mt, true)
+					env._saNamecallHooked = true
+					_saHookInstalled = true
+					print("[anti-enhancement] Rage/Silent namecall FireServer hooked")
+				end)
+			end
+			return _saHookInstalled == true
 		end
 
 		-- Install once in background (no tight rehook loop)
@@ -733,6 +827,21 @@ local function initMainScript()
 			warn("[anti-enhancement] Silent Aim: join match then toggle ON")
 		end)
 
+		env._silentAimSet = function(v)
+			S.silentAimOn = v and true or false
+			if S.silentAimOn then
+				pcall(function()
+					if type(saInstallHook) == "function" then saInstallHook() end
+				end)
+			end
+		end
+		env._espSet = function(v)
+			S.espOn = v and true or false
+		end
+		env._hitNotifierSet = function(v)
+			S.hitNotifierOn = v and true or false
+			S.hitNotifyOn = v and true or false
+		end
 		env._silentAimRehook = function()
 			if _saHookInstalled then
 				return true
@@ -886,23 +995,103 @@ local function _tcAddConsumer()
 		end
 
 								local function StartUserRagebot()
-			-- Shared UseItem.FireServer hook (same pipeline as silent aim)
+			-- Kicia-inspired rage: UseItem aim inject + auto-fire loop
 			S.ragebotOn = true
 			env._ragebotActive = true
+			S.ragebotStability = tonumber(S.ragebotStability) or 0
+			S.ragebotShootFrames = tonumber(S.ragebotShootFrames) or 1
+			env._ragebotStability = S.ragebotStability
+			env._ragebotShootFrames = S.ragebotShootFrames
 			pcall(function()
-				if type(saInstallHook) == "function" then
-					saInstallHook()
-				end
+				if type(saInstallHook) == "function" then saInstallHook() end
 			end)
 			pcall(function()
 				if env._silentAimRehook then env._silentAimRehook() end
 			end)
-			print("[anti-enhancement] Ragebot ON — shoot any direction, bullets redirect to closest enemy")
+			-- stop previous auto-fire
+			if env._rageAutoConn then
+				pcall(function() env._rageAutoConn:Disconnect() end)
+				env._rageAutoConn = nil
+			end
+			local lastFire = 0
+			env._rageAutoConn = RunService.Heartbeat:Connect(function()
+				if not S.ragebotOn then return end
+				local frames = math.clamp(tonumber(S.ragebotShootFrames) or 1, 1, 10)
+				local interval = math.max(0.02, 0.05 / frames)
+				local now = os.clock()
+				if now - lastFire < interval then return end
+				lastFire = now
+				pcall(function()
+					local char = player.Character
+					if not char then return end
+					-- resolve target
+					local part = env._rageTargetPart
+					if not part or not part.Parent then
+						-- light scan
+						local myRoot = char:FindFirstChild("HumanoidRootPart")
+						if not myRoot then return end
+						local best, bd = nil, 4000
+						local myTeam = player:GetAttribute("TeamID") or player.Team
+						for _, plr in ipairs(Players:GetPlayers()) do
+							if plr ~= player and plr.Character then
+								local theirTeam = plr:GetAttribute("TeamID") or plr.Team
+								if myTeam ~= nil and theirTeam ~= nil and myTeam == theirTeam then
+								else
+									if not (S.antiKatanaOn and _playerHoldingKatana and _playerHoldingKatana(plr)) then
+										local hum = plr.Character:FindFirstChildOfClass("Humanoid")
+										local head = plr.Character:FindFirstChild("HitboxHead") or plr.Character:FindFirstChild("Head")
+										local root = plr.Character:FindFirstChild("HumanoidRootPart")
+										if hum and hum.Health > 0 and head and root then
+											local d = (myRoot.Position - root.Position).Magnitude
+											if d < bd then bd = d; best = head end
+										end
+									end
+								end
+							end
+						end
+						part = best
+						env._rageTargetPart = part
+					end
+					if not part then return end
+					-- auto fire: Tool:Activate + VirtualInputManager (Kicia uses FighterState:Input)
+					local fired = false
+					for _, tool in ipairs(char:GetChildren()) do
+						if tool:IsA("Tool") then
+							pcall(function() tool:Activate() end)
+							fired = true
+						end
+					end
+					pcall(function()
+						local fctrl = require(player.PlayerScripts.Controllers.FighterController)
+						local fighter = fctrl.LocalFighter or (fctrl.GetFighter and fctrl:GetFighter(player))
+						if fighter and fighter.FighterState and type(fighter.FighterState.Input) == "function" then
+							fighter.FighterState:Input("StartShooting")
+							fired = true
+						end
+					end)
+					if not fired then
+						local vim = game:GetService("VirtualInputManager")
+						if vim then
+							vim:SendMouseButtonEvent(0, 0, 0, true, game, 0)
+							task.defer(function()
+								pcall(function() vim:SendMouseButtonEvent(0, 0, 0, false, game, 0) end)
+							end)
+						end
+					end
+				end)
+			end)
+			print("[anti-enhancement] Ragebot ON (Kicia-style auto-fire + aim inject)")
 		end
 
 		local function StopUserRagebot()
 			S.ragebotOn = false
 			env._ragebotActive = false
+			if env._rageAutoConn then
+				pcall(function() env._rageAutoConn:Disconnect() end)
+				env._rageAutoConn = nil
+			end
+			env._rageTargetPart = nil
+			env._rageTargetChar = nil
 			pcall(function()
 				local g = getgenv()
 				if g and g.__s9t0u1 then
@@ -968,6 +1157,10 @@ local function _tcAddConsumer()
 			if recoil ~= nil then info.ShootRecoil = (fastShoot or noSpread) and 0 or recoil end
 			local spread = rememberInfo(info, "ShootSpread")
 			if spread ~= nil then info.ShootSpread = (fastShoot or noSpread) and 0 or spread end
+			for _, sk in ipairs({"Spread", "BulletSpread", "MaxSpread", "MinSpread", "Bloom"}) do
+				local ov = rememberInfo(info, sk)
+				if ov ~= nil then info[sk] = (fastShoot or noSpread) and 0 or ov end
+			end
 			local ps = rememberInfo(info, "ProjectileSpeed")
 			if ps ~= nil then info.ProjectileSpeed = fastShoot and 99999999 or ps end
 			for _, key in ipairs({"ShootCooldown","QuickShotCooldown","BurstCooldown","AttackCooldown","Cooldown","HeavyAttackCooldown"}) do
@@ -1520,7 +1713,7 @@ local function _tcAddConsumer()
 					local orig = cls._DamageNumberEffect
 					cls._DamageNumberEffect = function(...)
 						local packed = table.pack(...)
-						if S.hitNotifyOn then
+						if S.hitNotifyOn or S.hitNotifierOn then
 							pcall(function()
 								local dmg, targetName
 								for i = 1, packed.n do
@@ -1947,7 +2140,7 @@ local function _tcAddConsumer()
 		watermarkLabel.AutomaticSize = Enum.AutomaticSize.X
 		watermarkLabel.BackgroundTransparency = 1
 		watermarkLabel.RichText = true
-		watermarkLabel.Text = 'anti-enhancement v0.2.8.5 | ' .. player.Name .. ' | <font color="rgb(100,180,255)">60 FPS</font>'
+		watermarkLabel.Text = 'anti-enhancement v0.2.8.6 | ' .. player.Name .. ' | <font color="rgb(100,180,255)">60 FPS</font>'
 		watermarkLabel.TextColor3 = Color3.fromRGB(200, 200, 210)
 		watermarkLabel.TextSize = 11
 		watermarkLabel.Font = Enum.Font.Code
@@ -1965,7 +2158,7 @@ local function _tcAddConsumer()
 				frameCount = 0
 				lastFpsUpdate = now
 				if S.showWatermarkOn then
-					watermarkLabel.Text = 'anti-enhancement v0.2.8.5 | ' .. player.Name .. ' | <font color="rgb(100,180,255)">' .. currentFps .. ' FPS</font>'
+					watermarkLabel.Text = 'anti-enhancement v0.2.8.6 | ' .. player.Name .. ' | <font color="rgb(100,180,255)">' .. currentFps .. ' FPS</font>'
 				end
 			end
 		end))
@@ -2256,7 +2449,7 @@ local function _tcAddConsumer()
 		title.Size = UDim2.new(1, -20, 1, 0)
 		title.Position = UDim2.fromOffset(10, 0)
 		title.BackgroundTransparency = 1
-		title.Text = "anti enhancement v0.2.8.5- https://discord.gg/6pH3NGVtm"
+		title.Text = "anti enhancement v0.2.8.6- https://discord.gg/6pH3NGVtm"
 		title.TextColor3 = Color3.fromRGB(180, 185, 200)
 		title.TextSize = 12
 		title.Font = Enum.Font.Gotham
@@ -3877,7 +4070,7 @@ local function _tcAddConsumer()
 					pcall(function()
 						if title then title.TextColor3 = col; title.Font = font end
 						if kbTitle then
-							kbTitle.Text = '<font color="rgb(' .. math.floor(col.R*255) .. ',' .. math.floor(col.G*255) .. ',' .. math.floor(col.B*255) .. ')">Keybinds (anti enhancement v0.2.8.5)</font>'
+							kbTitle.Text = '<font color="rgb(' .. math.floor(col.R*255) .. ',' .. math.floor(col.G*255) .. ',' .. math.floor(col.B*255) .. ')">Keybinds (anti enhancement v0.2.8.6)</font>'
 							kbTitle.Font = font
 						end
 						if watermarkLabel then watermarkLabel.Font = font end
@@ -4830,8 +5023,14 @@ local function _tcAddConsumer()
 
 			env._openSkinPicker = function()
 				pcall(function()
+					if env._installHarionSkin then env._installHarionSkin() end
 					if allSkinBtn and allSkinBtn.Parent then
-						-- emulate by setting opening flag handled inside click
+						-- user can click OPEN; try fire connections if available
+						if typeof(getconnections) == "function" then
+							for _, c in ipairs(getconnections(allSkinBtn.MouseButton1Click)) do
+								pcall(function() c:Fire() end)
+							end
+						end
 					end
 				end)
 			end
@@ -5651,7 +5850,7 @@ env._pageUI = {
 			upLbl.Position = UDim2.fromOffset(6, -8)
 			upLbl.BackgroundColor3 = Color3.fromRGB(14, 14, 18)
 			upLbl.BackgroundTransparency = 0
-			upLbl.Text = " updates (v0.2.8.5) "
+			upLbl.Text = " updates (v0.2.8.6) "
 			upLbl.TextColor3 = Color3.fromRGB(100, 180, 255)
 			upLbl.TextSize = 12
 			upLbl.Font = Enum.Font.Code
@@ -5676,7 +5875,7 @@ env._pageUI = {
 			updateBody.Font = Enum.Font.Code
 			updateBody.TextWrapped = true
 			updateBody.Text = table.concat({
-				"v0.2.8.5",
+				"v0.2.8.6",
 				"- Silent Aim v16 (UseItem.FireServer only)",
 				"- Removed Workspace Raycast hook (C stack fix)",
 				"- ESP Rank / WS / Distance / Weapon detection",
@@ -5934,7 +6133,46 @@ env._pageUI = {
 						setLine(c.Box[3], x2, y2, x1, y2, col, true)
 						setLine(c.Box[4], x1, y2, x1, y1, col, true)
 
-						if S.namesOn or S.espOn then
+						-- Tracers (Kicia-style)
+						if S.espTracer then
+							if not c.Tracer then
+								c.Tracer = Drawing.new("Line")
+								c.Tracer.Thickness = 1
+							end
+							local vp = cam.ViewportSize
+							c.Tracer.From = Vector2.new(vp.X / 2, vp.Y)
+							c.Tracer.To = Vector2.new(pos.X, pos.Y)
+							c.Tracer.Color = col
+							c.Tracer.Visible = true
+						elseif c.Tracer then
+							c.Tracer.Visible = false
+						end
+
+						-- Chams / Geometry highlight
+						if S.espGeometry then
+							if not c.Highlight or not c.Highlight.Parent then
+								pcall(function()
+									local hl = Instance.new("Highlight")
+									hl.FillColor = col
+									hl.OutlineColor = Color3.new(1, 1, 1)
+									hl.FillTransparency = 0.55
+									hl.OutlineTransparency = 0
+									hl.Adornee = char
+									hl.Parent = char
+									c.Highlight = hl
+								end)
+							else
+								pcall(function()
+									c.Highlight.FillColor = col
+									c.Highlight.Adornee = char
+								end)
+							end
+						elseif c.Highlight then
+							pcall(function() c.Highlight:Destroy() end)
+							c.Highlight = nil
+						end
+
+						if S.namesOn or S.espOn or S.espEnemyName then
 							if not c.Name then
 								c.Name = Drawing.new("Text")
 								c.Name.Center = true
@@ -6528,6 +6766,115 @@ env._pageUI = {
 		pcall(function() showPage("main") end)
 		if gui then gui.Enabled = false end -- legacy UI hidden; Obsidian is primary
 
+
+		-- ========== Kicia Skyboxes (from Kicia Rebuild gX catalog) ==========
+		local KICIA_SKYBOXES = {
+	GreenHaze = {SkyboxUp="rbxassetid://160193458",SkyboxBk="rbxassetid://160193404",SkyboxFt="rbxassetid://160193461",SunAngularSize=0,SkyboxLf="rbxassetid://160193469",SkyboxRt="rbxassetid://160193463",SkyboxDn="rbxassetid://160193466"},
+	Space2 = {StarCount=3000,SkyboxUp="rbxassetid://11844053742",MoonTextureId="rbxassetid://11844121592",SkyboxBk="rbxassetid://11844076072",SkyboxDn="rbxassetid://11844069700",SkyboxFt="rbxassetid://11844067209",SunAngularSize=11,SkyboxLf="rbxassetid://11844063543",SkyboxRt="rbxassetid://11844058446",MoonAngularSize=20},
+	PinkMountains = {StarCount=3000,SkyboxUp="rbxassetid://160188588",SkyboxFt="rbxassetid://160188609",SkyboxLf="rbxassetid://160188589",SkyboxDn="rbxassetid://160188614",SunAngularSize=21,SkyboxBk="rbxassetid://160188495",SkyboxRt="rbxassetid://160188597",MoonAngularSize=0},
+	Valentines = {StarCount=3000,SkyboxUp="rbxassetid://11427771954",SkyboxFt="rbxassetid://11427769401",SkyboxLf="rbxassetid://11427769401",SkyboxDn="rbxassetid://11427770685",SunAngularSize=21,SkyboxBk="rbxassetid://11427769401",SkyboxRt="rbxassetid://11427769401",MoonAngularSize=0},
+	PinkArt = {StarCount=3000,SkyboxUp="rbxassetid://79190209626172",SkyboxFt="rbxassetid://104560113223878",SkyboxLf="rbxassetid://80395333901607",SkyboxDn="rbxassetid://78865378050055",SunAngularSize=21,SkyboxBk="rbxassetid://71607054149497",SkyboxRt="rbxassetid://87570388049514",MoonAngularSize=0},
+	PurplePlanet = {StarCount=3000,SkyboxUp="rbxassetid://16262366016",MoonTextureId="rbxassetid://6444320592",SkyboxFt="rbxassetid://16262360469",SkyboxLf="rbxassetid://16262362003",SkyboxDn="rbxassetid://16262358026",SunTextureId="rbxassetid://8281961896",SunAngularSize=21,SkyboxBk="rbxassetid://16262356578",SkyboxRt="rbxassetid://16262363873",MoonAngularSize=0},
+	Blizzard = {StarCount=3000,SkyboxUp="rbxassetid://16653228333",MoonTextureId="rbxassetid://6444320592",SkyboxBk="rbxassetid://16653221738",SkyboxFt="rbxassetid://16653224051",SkyboxDn="rbxassetid://16653222701",SunTextureId="rbxassetid://6196665106",SunAngularSize=21,SkyboxLf="rbxassetid://16653225849",SkyboxRt="rbxassetid://16653227200",MoonAngularSize=0},
+	Winter = {StarCount=3000,SkyboxUp="rbxassetid://155674931",MoonTextureId="rbxassetid://6444320592",SkyboxBk="rbxassetid://155657655",SkyboxFt="rbxassetid://155657609",SkyboxLf="rbxassetid://155657671",SunTextureId="rbxassetid://8281961896",SunAngularSize=21,SkyboxDn="rbxassetid://155674246",SkyboxRt="rbxassetid://155657619",MoonAngularSize=11},
+	FlamingSunset = {StarCount=3000,SkyboxUp="rbxassetid://415688354",MoonTextureId="rbxassetid://6444320592",SkyboxBk="rbxassetid://415688378",SkyboxFt="rbxassetid://415688242",SkyboxDn="rbxassetid://415688193",SunTextureId="rbxassetid://6196665106",SunAngularSize=0,SkyboxLf="rbxassetid://415688310",SkyboxRt="rbxassetid://415688274",MoonAngularSize=0},
+	Mountains = {StarCount=3000,SkyboxUp="rbxassetid://15359412677",SkyboxLf="rbxassetid://15359411633",MoonTextureId="rbxassetid://6444320592",SkyboxDn="rbxassetid://15359411132",SkyboxBk="rbxassetid://15359410490",SunTextureId="rbxassetid://8281961896",SunAngularSize=21,SkyboxFt="rbxassetid://15359412131",SkyboxRt="rbxassetid://15359417656",MoonAngularSize=0},
+	FPSBoost = {StarCount=3000,SkyboxUp="rbxassetid://11457548274",MoonTextureId="rbxassetid://6444320592",SkyboxFt="rbxassetid://11457548274",SkyboxLf="rbxassetid://11457548274",SkyboxDn="rbxassetid://11457548274",SunTextureId="rbxassetid://8281961896",SunAngularSize=0,SkyboxBk="rbxassetid://11457548274",SkyboxRt="rbxassetid://11457548274",MoonAngularSize=0},
+	AestheticMountains = {StarCount=3000,SkyboxUp="rbxassetid://15470207755",MoonTextureId="rbxassetid://6444320592",SkyboxLf="rbxassetid://15470202648",SkyboxBk="rbxassetid://15470198023",SkyboxFt="rbxassetid://15470200128",SunTextureId="rbxassetid://6196665106",SunAngularSize=21,SkyboxDn="rbxassetid://15470151245",SkyboxRt="rbxassetid://15470204862",MoonAngularSize=11},
+	BetterNight3 = {StarCount=500,SkyboxUp="rbxassetid://2670644331",MoonTextureId="rbxassetid://1075087760",SkyboxLf="rbxassetid://2670643070",SkyboxBk="rbxassetid://2670643994",SkyboxFt="rbxassetid://2670643214",SunTextureId="rbxassetid://6196665106",SunAngularSize=21,SkyboxDn="rbxassetid://2670643365",SkyboxRt="rbxassetid://2670644173",MoonAngularSize=1.5},
+	Galaxy2 = {StarCount=500,SkyboxUp="rbxassetid://14164405298",MoonTextureId="rbxassetid://6444320592",SkyboxLf="rbxassetid://14164398493",SkyboxBk="rbxassetid://14164368678",SkyboxFt="rbxassetid://14164389230",SunTextureId="rbxassetid://8281961896",SunAngularSize=0,SkyboxDn="rbxassetid://14164386126",SkyboxRt="rbxassetid://14164402782",MoonAngularSize=0},
+	Aesthetic3 = {StarCount=500,SkyboxUp="rbxassetid://151165227",MoonTextureId="rbxassetid://6444320592",SkyboxLf="rbxassetid://151165191",SkyboxBk="rbxassetid://151165214",SkyboxFt="rbxassetid://151165224",SunTextureId="rbxassetid://8281961896",SunAngularSize=0,SkyboxDn="rbxassetid://151165197",SkyboxRt="rbxassetid://151165206",MoonAngularSize=0},
+	PurpleSpace = {StarCount=3000,SkyboxUp="rbxassetid://15983964246",MoonTextureId="rbxassetid://6444320592",SkyboxLf="rbxassetid://15983967420",SkyboxBk="rbxassetid://15983968922",SkyboxFt="rbxassetid://5260817288",SunTextureId="rbxassetid://8281961896",SunAngularSize=0,SkyboxDn="rbxassetid://15983966825",SkyboxRt="rbxassetid://15983966246",MoonAngularSize=0},
+	Pink = {StarCount=3000,SkyboxUp="rbxassetid://271077958",MoonTextureId="rbxassetid://6444320592",SkyboxLf="rbxassetid://271042310",SkyboxBk="rbxassetid://271042516",SkyboxFt="rbxassetid://271042556",SunTextureId="rbxassetid://8281961896",SunAngularSize=0,SkyboxDn="rbxassetid://271077243",SkyboxRt="rbxassetid://271042467",MoonAngularSize=0},
+	PurpleNight = {StarCount=3000,SkyboxUp="rbxassetid://5084576400",MoonTextureId="rbxassetid://6444320592",SkyboxFt="rbxassetid://5260817288",SkyboxBk="rbxassetid://5260808177",SkyboxDn="rbxassetid://5260653793",SunTextureId="rbxassetid://8281961896",SunAngularSize=0,SkyboxLf="rbxassetid://5260800833",SkyboxRt="rbxassetid://5260800833",MoonAngularSize=0},
+	Flame = {StarCount=3000,SkyboxUp="rbxassetid://6286790025",MoonTextureId="rbxassetid://6444320592",SkyboxLf="rbxassetid://6286785801",SkyboxBk="rbxassetid://6286780109",SkyboxFt="rbxassetid://6286784186",SunTextureId="rbxassetid://8281961896",SunAngularSize=21,SkyboxDn="rbxassetid://6286782353",SkyboxRt="rbxassetid://6286788245",MoonAngularSize=0},
+	Galaxy3 = {StarCount=3000,SkyboxUp="rbxassetid://14543371676",MoonTextureId="rbxassetid://6444320592",SkyboxFt="rbxassetid://14543257810",SkyboxBk="rbxassetid://14543264135",SkyboxDn="rbxassetid://14543358958",SunTextureId="rbxassetid://8281961896",SunAngularSize=0,SkyboxLf="rbxassetid://14543275895",SkyboxRt="rbxassetid://14543280890",MoonAngularSize=0},
+	Storm = {SkyboxUp="rbxassetid://1618913654",MoonTextureId="rbxassetid://1075087760",SkyboxFt="rbxassetid://1618913244",SkyboxBk="rbxassetid://1618912481",SkyboxDn="rbxassetid://1618913943",SunTextureId="rbxassetid://1084351190",SunAngularSize=0,SkyboxLf="rbxassetid://1618912849",SkyboxRt="rbxassetid://1618911568",MoonAngularSize=0},
+	Milkyway = {StarCount=3000,SkyboxUp="rbxassetid://137817405681365",MoonTextureId="rbxassetid://6444320592",SkyboxFt="rbxassetid://104400530594543",SkyboxBk="rbxassetid://129876530632297",SkyboxDn="rbxassetid://108406529909981",SunTextureId="rbxassetid://8281961896",SunAngularSize=0,SkyboxLf="rbxassetid://73372229972523",SkyboxRt="rbxassetid://87408857415924",MoonAngularSize=0},
+	PurpleClouds = {StarCount=3000,SkyboxUp="rbxassetid://570557727",MoonTextureId="rbxassetid://6444320592",SkyboxDn="rbxassetid://570557775",SkyboxLf="rbxassetid://570557620",SkyboxBk="rbxassetid://570557514",SunTextureId="rbxassetid://8281961896",SunAngularSize=21,SkyboxFt="rbxassetid://570557559",SkyboxRt="rbxassetid://570557672",MoonAngularSize=0},
+	BlueClouds = {StarCount=3000,SkyboxUp="rbxassetid://591059642",MoonTextureId="rbxassetid://6444320592",SkyboxLf="rbxassetid://591057861",SkyboxBk="rbxassetid://591058823",SkyboxFt="rbxassetid://591058104",SunTextureId="rbxassetid://6196665106",SunAngularSize=0,SkyboxDn="rbxassetid://591059876",SkyboxRt="rbxassetid://591057625",MoonAngularSize=0},
+	BetterNight = {StarCount=3000,SkyboxUp="rbxassetid://15470303050",SkyboxFt="rbxassetid://15470294431",SkyboxBk="rbxassetid://15470289121",SkyboxDn="rbxassetid://15470291746",SkyboxLf="rbxassetid://15470297162",SkyboxRt="rbxassetid://15470299887"},
+	Cloudy = {StarCount=3000,SkyboxUp="rbxassetid://4495867486",SkyboxFt="rbxassetid://4495865458",SkyboxBk="rbxassetid://4495864450",SkyboxDn="rbxassetid://4495864887",SkyboxLf="rbxassetid://4495866035",SkyboxRt="rbxassetid://4495866584"},
+	NetherWorld = {StarCount=3000,SkyboxUp="rbxassetid://14365019327",MoonTextureId="rbxassetid://6444320592",SkyboxFt="rbxassetid://14365018399",SkyboxLf="rbxassetid://14365018705",SkyboxDn="rbxassetid://14365023350",SunTextureId="rbxassetid://8281961896",SunAngularSize=0,SkyboxBk="rbxassetid://14365019002",SkyboxRt="rbxassetid://14365018143",MoonAngularSize=0},
+	NewYork = {StarCount=3000,SkyboxUp="rbxassetid://11333967970",MoonTextureId="rbxassetid://6444320592",SkyboxBk="rbxassetid://11333973069",SkyboxFt="rbxassetid://11333964303",SkyboxDn="rbxassetid://11333969768",SunTextureId="rbxassetid://6196665106",SunAngularSize=0,SkyboxLf="rbxassetid://11333971332",SkyboxRt="rbxassetid://11333982864",MoonAngularSize=0},
+	Purple2 = {StarCount=3000,SkyboxUp="rbxassetid://8107849791",MoonTextureId="rbxassetid://6444320592",SkyboxBk="rbxassetid://8107841671",SkyboxFt="rbxassetid://8107841671",SkyboxDn="rbxassetid://6444884785",SunTextureId="rbxassetid://6196665106",SunAngularSize=11,SkyboxLf="rbxassetid://8107841671",SkyboxRt="rbxassetid://8107841671",MoonAngularSize=0},
+	FunnyStorm = {StarCount=3000,SkyboxUp="rbxassetid://6280942402",MoonTextureId="rbxassetid://6444320592",SkyboxDn="rbxassetid://6280935347",SkyboxLf="rbxassetid://6280938749",SkyboxBk="rbxassetid://6280934001",SunTextureId="rbxassetid://8281961896",SunAngularSize=21,SkyboxFt="rbxassetid://6280936575",SkyboxRt="rbxassetid://6280940989",MoonAngularSize=0},
+	Galaxy = {StarCount=3000,SkyboxUp="rbxassetid://159454288",MoonTextureId="rbxassetid://6444320592",SkyboxFt="rbxassetid://159454293",SkyboxLf="rbxassetid://159454293",SkyboxDn="rbxassetid://159454296",SunTextureId="rbxassetid://8281961896",SunAngularSize=0,SkyboxBk="rbxassetid://159454299",SkyboxRt="rbxassetid://159454293",MoonAngularSize=0},
+	BlueSpace = {StarCount=3000,SkyboxUp="rbxassetid://16876552681",MoonTextureId="rbxassetid://6444320592",SkyboxLf="rbxassetid://16876548320",SkyboxBk="rbxassetid://16876541778",SkyboxFt="rbxassetid://16876546384",SunTextureId="rbxassetid://8281961896",SunAngularSize=21,SkyboxDn="rbxassetid://16876543880",SkyboxRt="rbxassetid://16876550345",MoonAngularSize=0},
+	Purple3 = {StarCount=3000,SkyboxUp="rbxassetid://433274285",MoonTextureId="rbxassetid://6444320592",SkyboxFt="rbxassetid://433274131",SkyboxLf="rbxassetid://433274370",SkyboxDn="rbxassetid://433274194",SunTextureId="rbxassetid://8281961896",SunAngularSize=0,SkyboxBk="rbxassetid://433274085",SkyboxRt="rbxassetid://433274429",MoonAngularSize=0},
+	Nebula2 = {StarCount=3000,SkyboxUp="rbxassetid://16932810138",MoonTextureId="rbxassetid://6444320592",SkyboxFt="rbxassetid://16932800523",SkyboxLf="rbxassetid://16932803722",SkyboxDn="rbxassetid://16932797813",SunTextureId="rbxassetid://8281961896",SunAngularSize=0,SkyboxBk="rbxassetid://16932794531",SkyboxRt="rbxassetid://16932806825",MoonAngularSize=0},
+	Nebula = {StarCount=3000,SkyboxUp="rbxassetid://5260824661",MoonTextureId="rbxassetid://6444320592",SkyboxLf="rbxassetid://5260800833",SkyboxDn="rbxassetid://5260653793",SkyboxBk="rbxassetid://5260808177",SunTextureId="rbxassetid://8281961896",SunAngularSize=0,SkyboxFt="rbxassetid://5260817288",SkyboxRt="rbxassetid://5260811073",MoonAngularSize=0},
+	LunarNight = {StarCount=0,SkyboxUp="rbxassetid://187712111",MoonTextureId="rbxassetid://6444320592",SkyboxBk="rbxassetid://187713366",SkyboxFt="rbxassetid://187712836",SkyboxLf="rbxassetid://187713755",SunTextureId="rbxassetid://8281961896",SunAngularSize=0,SkyboxDn="rbxassetid://187712428",SkyboxRt="rbxassetid://187714525",MoonAngularSize=0},
+	Purple = {StarCount=3000,SkyboxUp="rbxassetid://8539981085",MoonTextureId="rbxassetid://6444320592",SkyboxBk="rbxassetid://8539982183",SkyboxFt="rbxassetid://8539981721",SkyboxLf="rbxassetid://8539981424",SunTextureId="rbxassetid://8281961896",SunAngularSize=0,SkyboxDn="rbxassetid://8539981943",SkyboxRt="rbxassetid://8539980766",MoonAngularSize=0},
+	Hell = {StarCount=3000,SkyboxUp="rbxassetid://11730857150",MoonTextureId="rbxassetid://6444320592",SkyboxBk="rbxassetid://11730840088",SkyboxFt="rbxassetid://11730849615",SkyboxLf="rbxassetid://11730852920",SunTextureId="rbxassetid://8281961896",SunAngularSize=0,SkyboxDn="rbxassetid://11730842997",SkyboxRt="rbxassetid://11730855491",MoonAngularSize=11},
+	Nebula6 = {StarCount=3000,SkyboxUp="rbxassetid://16694204069",MoonTextureId="rbxassetid://6444320592",SkyboxLf="rbxassetid://16694197080",SkyboxDn="rbxassetid://16694190947",SkyboxBk="rbxassetid://16694187412",SunTextureId="rbxassetid://8281961896",SunAngularSize=21,SkyboxFt="rbxassetid://16694194795",SkyboxRt="rbxassetid://16694200892",MoonAngularSize=11},
+	DarkishPink = {StarCount=3000,SkyboxUp="rbxassetid://570555929",MoonTextureId="rbxassetid://6444320592",SkyboxLf="rbxassetid://570555840",SkyboxDn="rbxassetid://570555964",SkyboxBk="rbxassetid://570555736",SunTextureId="rbxassetid://8281961896",SunAngularSize=21,SkyboxFt="rbxassetid://570555800",SkyboxRt="rbxassetid://570555882",MoonAngularSize=11},
+	RedNight = {StarCount=3000,SkyboxUp="rbxassetid://401664936",MoonTextureId="rbxassetid://6444320592",SkyboxBk="rbxassetid://401664839",SkyboxFt="rbxassetid://401664960",SkyboxLf="rbxassetid://401664881",SunTextureId="rbxassetid://8281961896",SunAngularSize=0,SkyboxDn="rbxassetid://401664862",SkyboxRt="rbxassetid://401664901",MoonAngularSize=0},
+	Space = {StarCount=3000,SkyboxUp="rbxassetid://166510114",MoonTextureId="rbxassetid://6444320592",SkyboxDn="rbxassetid://166510057",SkyboxBk="rbxassetid://166509999",SkyboxFt="rbxassetid://166510116",SunTextureId="rbxassetid://8281961896",SunAngularSize=0,SkyboxLf="rbxassetid://166510092",SkyboxRt="rbxassetid://166510131",MoonAngularSize=0},
+	OverPlanet = {StarCount=3000,SkyboxUp="rbxassetid://165052345",MoonTextureId="rbxassetid://6444320592",SkyboxLf="rbxassetid://165052365",SkyboxDn="rbxassetid://165052286",SkyboxBk="rbxassetid://165052268",SunTextureId="rbxassetid://8281961896",SunAngularSize=21,SkyboxFt="rbxassetid://165052328",SkyboxRt="rbxassetid://165052306",MoonAngularSize=11},
+	Orange = {StarCount=3000,SkyboxUp="rbxassetid://150939082",MoonTextureId="rbxassetid://6444320592",SkyboxDn="rbxassetid://150939038",SkyboxBk="rbxassetid://150939022",SkyboxFt="rbxassetid://150939047",SunTextureId="rbxassetid://8281961896",SunAngularSize=0,SkyboxLf="rbxassetid://150939056",SkyboxRt="rbxassetid://150939063",MoonAngularSize=0},
+	Pastel = {StarCount=3000,SkyboxUp="rbxassetid://2128462236",MoonTextureId="rbxassetid://6444320592",SkyboxDn="rbxassetid://2128462480",SkyboxBk="rbxassetid://2128458653",SkyboxFt="rbxassetid://2128458653",SunTextureId="rbxassetid://8281961896",SunAngularSize=0,SkyboxLf="rbxassetid://2128462027",SkyboxRt="rbxassetid://2128462027",MoonAngularSize=0},
+	Beach = {StarCount=0,SkyboxUp="rbxassetid://173380790",MoonTextureId="rbxassetid://6444320592",SkyboxDn="rbxassetid://173380627",SkyboxBk="rbxassetid://173380597",SkyboxFt="rbxassetid://173380642",SunTextureId="rbxassetid://8281961896",SunAngularSize=21,SkyboxLf="rbxassetid://173380671",SkyboxRt="rbxassetid://173380774",MoonAngularSize=11},
+	FakeClouds = {StarCount=3000,SkyboxUp="rbxassetid://8496897504",MoonTextureId="rbxassetid://6444320592",SkyboxDn="rbxassetid://8496896250",SkyboxBk="rbxassetid://8496892810",SkyboxFt="rbxassetid://8496892810",SunTextureId="rbxassetid://8281961896",SunAngularSize=0,SkyboxLf="rbxassetid://8496892810",SkyboxRt="rbxassetid://8496892810",MoonAngularSize=0},
+	Aesthetic2 = {StarCount=3000,SkyboxUp="rbxassetid://600835177",MoonTextureId="rbxassetid://6444320592",SkyboxBk="rbxassetid://600830446",SkyboxFt="rbxassetid://600832720",SkyboxLf="rbxassetid://600886090",SunTextureId="rbxassetid://8281961896",SunAngularSize=0,SkyboxDn="rbxassetid://600831635",SkyboxRt="rbxassetid://600833862",MoonAngularSize=0},
+	Nebula4 = {StarCount=3000,SkyboxUp="rbxassetid://17103639457",MoonTextureId="rbxassetid://6444320592",SkyboxDn="rbxassetid://17103622190",SkyboxBk="rbxassetid://17103618635",SkyboxFt="rbxassetid://17103624898",SunTextureId="rbxassetid://8281961896",SunAngularSize=0,SkyboxLf="rbxassetid://17103628153",SkyboxRt="rbxassetid://17103636666",MoonAngularSize=0},
+	BluePlanet = {StarCount=3000,SkyboxUp="rbxassetid://16889004122",SkyboxLf="rbxassetid://16888998994",MoonTextureId="rbxassetid://6444320592",SkyboxDn="rbxassetid://16888991855",SkyboxBk="rbxassetid://16888989874",SunTextureId="rbxassetid://8281961896",SunAngularSize=21,SkyboxFt="rbxassetid://16888995219",SkyboxRt="rbxassetid://16889000916",MoonAngularSize=0},
+	Nebula5 = {StarCount=3000,SkyboxUp="rbxassetid://17124369657",MoonTextureId="rbxassetid://6444320592",SkyboxDn="rbxassetid://17124359797",SkyboxBk="rbxassetid://17124357467",SkyboxFt="rbxassetid://17124362093",SunTextureId="rbxassetid://8281961896",SunAngularSize=0,SkyboxLf="rbxassetid://17124365127",SkyboxRt="rbxassetid://17124367200",MoonAngularSize=0},
+	LunarNight2 = {StarCount=3000,SkyboxUp="rbxassetid://14365026442",MoonTextureId="rbxassetid://6444320592",SkyboxDn="rbxassetid://14365026242",SkyboxLf="rbxassetid://14365025904",SkyboxBk="rbxassetid://14365026085",SunTextureId="rbxassetid://8281961896",SunAngularSize=21,SkyboxFt="rbxassetid://14365025735",SkyboxRt="rbxassetid://14365025444",MoonAngularSize=0},
+	Pinkie = {StarCount=0,SkyboxUp="rbxassetid://11554996247",MoonTextureId="rbxassetid://6444320592",SkyboxDn="rbxassetid://11555013415",SkyboxBk="rbxassetid://11555017034",SkyboxFt="rbxassetid://11555010145",SunTextureId="rbxassetid://8281961896",SunAngularSize=0,SkyboxLf="rbxassetid://11555006545",SkyboxRt="rbxassetid://11555000712",MoonAngularSize=1.5},
+	PurpleMountains = {StarCount=3000,SkyboxUp="rbxassetid://17901365106",MoonTextureId="rbxassetid://6444320592",SkyboxLf="rbxassetid://17901359687",SkyboxDn="rbxassetid://17901366771",SkyboxBk="rbxassetid://17901353811",SunTextureId="rbxassetid://8281961896",SunAngularSize=0,SkyboxFt="rbxassetid://17901356262",SkyboxRt="rbxassetid://17901362326",MoonAngularSize=0},
+	DarkClouds = {StarCount=0,SkyboxUp="rbxassetid://190477146",SkyboxDn="rbxassetid://190477222",MoonTextureId="rbxassetid://6444320592",SkyboxLf="rbxassetid://190477185",SkyboxBk="rbxassetid://190477248",SunTextureId="rbxassetid://8281961896",SunAngularSize=0,SkyboxFt="rbxassetid://190477200",SkyboxRt="rbxassetid://190477166",MoonAngularSize=1.5},
+	BetterNight2 = {StarCount=3000,SkyboxBk="rbxassetid://248431616",SkyboxUp="rbxassetid://248431605",SkyboxDn="rbxassetid://248431677",MoonTextureId="rbxassetid://6444320592",SkyboxLf="rbxassetid://248431686",SunTextureId="rbxassetid://8281961896",SunAngularSize=0,SkyboxFt="rbxassetid://248431598",SkyboxRt="rbxassetid://248431611",MoonAngularSize=1.5},
+	DarkMountains = {StarCount=3000,SkyboxUp="rbxassetid://5098819127",MoonTextureId="rbxassetid://6444320592",SkyboxBk="rbxassetid://5098814730",SkyboxFt="rbxassetid://5098815653",SkyboxDn="rbxassetid://5098815227",SunTextureId="rbxassetid://6196665106",SunAngularSize=0,SkyboxLf="rbxassetid://5098816155",SkyboxRt="rbxassetid://5098820352",MoonAngularSize=0},
+	Nebula3 = {StarCount=3000,SkyboxUp="rbxassetid://17839226876",MoonTextureId="rbxassetid://6444320592",SkyboxBk="rbxassetid://17839210699",SkyboxFt="rbxassetid://17839218166",SkyboxLf="rbxassetid://17839220800",SunTextureId="rbxassetid://8281961896",SunAngularSize=0,SkyboxDn="rbxassetid://17839215896",SkyboxRt="rbxassetid://17839223605",MoonAngularSize=0},
+	BetterSky = {StarCount=3000,SkyboxUp="rbxassetid://591059642",MoonTextureId="rbxassetid://6444320592",SkyboxLf="rbxassetid://591057861",SkyboxBk="rbxassetid://591058823",SkyboxFt="rbxassetid://591058104",SunTextureId="rbxassetid://6196665106",SunAngularSize=0,SkyboxDn="rbxassetid://591059876",SkyboxRt="rbxassetid://591057625",MoonAngularSize=0},
+	MagentaOrange = {StarCount=3000,SkyboxUp="rbxassetid://566616187",MoonTextureId="rbxassetid://6444320592",SkyboxFt="rbxassetid://566616141",SkyboxBk="rbxassetid://566616113",SkyboxDn="rbxassetid://566616232",SunTextureId="rbxassetid://8281961896",SunAngularSize=0,SkyboxLf="rbxassetid://566616044",SkyboxRt="rbxassetid://566616082",MoonAngularSize=0},
+	Aesthetic = {StarCount=3000,SkyboxUp="rbxassetid://1417494643",MoonTextureId="rbxassetid://6444320592",SkyboxFt="rbxassetid://1417494253",SkyboxBk="rbxassetid://1417494030",SkyboxDn="rbxassetid://1417494146",SunTextureId="rbxassetid://8281961896",SunAngularSize=0,SkyboxLf="rbxassetid://1417494402",SkyboxRt="rbxassetid://1417494499",MoonAngularSize=0},
+	Alien = {StarCount=0,SkyboxUp="rbxassetid://159248176",MoonTextureId="rbxassetid://6444320592",SkyboxFt="rbxassetid://159248187",SkyboxBk="rbxassetid://159248188",SkyboxDn="rbxassetid://159248183",SunTextureId="rbxasset://sky/sun.jpg",SunAngularSize=21,SkyboxLf="rbxassetid://159248173",SkyboxRt="rbxassetid://159248192",MoonAngularSize=0},
+	Lunar = {StarCount=3000,SkyboxUp="rbxassetid://179724054",MoonTextureId="rbxasset://sky/moon.jpg",SkyboxFt="rbxassetid://179724018",SkyboxBk="rbxassetid://179723991",SkyboxDn="rbxassetid://179724005",SunTextureId="rbxasset://sky/sun.jpg",SunAngularSize=21,SkyboxLf="rbxassetid://179724029",SkyboxRt="rbxassetid://179724037",MoonAngularSize=0},
+	Retro = {StarCount=3000,SkyboxUp="rbxassetid://16642401907",MoonTextureId="rbxasset://sky/moon.jpg",SkyboxFt="rbxassetid://16642398372",SkyboxBk="rbxassetid://16642396302",SkyboxDn="rbxassetid://16642397027",SunTextureId="rbxasset://sky/sun.jpg",SunAngularSize=21,SkyboxLf="rbxassetid://16642399309",SkyboxRt="rbxassetid://16642400745",MoonAngularSize=0},
+	Realistic = {StarCount=3000,SkyboxUp="rbxassetid://402560052",MoonTextureId="rbxasset://sky/moon.jpg",SkyboxFt="rbxassetid://402559953",SkyboxBk="rbxassetid://402559900",SkyboxDn="rbxassetid://402559927",SunTextureId="rbxasset://sky/sun.jpg",SunAngularSize=21,SkyboxLf="rbxassetid://402559983",SkyboxRt="rbxassetid://402560019",MoonAngularSize=0},
+	Midnight = {StarCount=3000,SkyboxUp="rbxassetid://154185031",MoonTextureId="rbxasset://sky/moon.jpg",SkyboxFt="rbxassetid://154185021",SkyboxBk="rbxassetid://154185004",SkyboxDn="rbxassetid://154184960",SunTextureId="rbxasset://sky/sun.jpg",SunAngularSize=21,SkyboxLf="rbxassetid://154184943",SkyboxRt="rbxassetid://154184972",MoonAngularSize=0},
+	Antartica = {StarCount=3000,SkyboxUp="rbxassetid://2118766003",MoonTextureId="rbxasset://sky/moon.jpg",SkyboxFt="rbxassetid://2118765204",SkyboxBk="rbxassetid://2118763079",SkyboxDn="rbxassetid://2118766919",SunTextureId="rbxasset://sky/sun.jpg",SunAngularSize=21,SkyboxLf="rbxassetid://2118764070",SkyboxRt="rbxassetid://2118761853"},
+	Moon = {StarCount=3000,SkyboxUp="rbxassetid://17489393055",MoonTextureId="rbxasset://sky/moon.jpg",SkyboxFt="rbxassetid://17489388310",SkyboxBk="rbxassetid://17489386489",SkyboxDn="rbxassetid://17489387417",SunTextureId="rbxasset://sky/sun.jpg",SunAngularSize=21,SkyboxLf="rbxassetid://17489389632",SkyboxRt="rbxassetid://17489391101"},
+	NightMountains = {StarCount=3000,MoonAngularSize=11,SkyboxUp="rbxassetid://264907379",MoonTextureId="rbxasset://sky/moon.jpg",SkyboxFt="rbxassetid://264909420",SkyboxBk="rbxassetid://264908339",SkyboxDn="rbxassetid://264907909",SunTextureId="rbxasset://sky/sun.jpg",SunAngularSize=21,SkyboxLf="rbxassetid://264909758",SkyboxRt="rbxassetid://264908886"},
+	Art = {StarCount=3000,MoonAngularSize=11,SkyboxUp="rbxassetid://9831769868",MoonTextureId="rbxassetid://6444320592",SkyboxFt="rbxassetid://9831766232",SkyboxBk="rbxassetid://9831762777",SkyboxDn="rbxassetid://9831764283",SunTextureId="rbxasset://sky/sun.jpg",SunAngularSize=21,SkyboxLf="rbxassetid://9831768023",SkyboxRt="rbxassetid://9831768909"},
+	Ame = {StarCount=3000,MoonAngularSize=11,SkyboxUp="rbxassetid://160186148",MoonTextureId="rbxassetid://6444320592",SkyboxFt="rbxassetid://160186027",SkyboxBk="rbxassetid://160185927",SkyboxDn="rbxassetid://160185945",SunTextureId="rbxasset://sky/sun.jpg",SunAngularSize=21,SkyboxLf="rbxassetid://160186075",SkyboxRt="rbxassetid://160186126"},
+	Dawn = {StarCount=3000,MoonAngularSize=11,SkyboxUp="rbxassetid://250381047",SkyboxFt="rbxassetid://250380916",SkyboxBk="rbxassetid://250381017",SkyboxDn="rbxassetid://254156892",SunTextureId="rbxasset://sky/sun.jpg",SunAngularSize=21,SkyboxLf="rbxassetid://250380953",SkyboxRt="rbxassetid://250380985"},
+}
+		env._KICIA_SKYBOXES = KICIA_SKYBOXES
+		local function applyKiciaSkybox(name)
+			local preset = KICIA_SKYBOXES[name]
+			if type(preset) ~= "table" then return false end
+			return pcall(function()
+				local sky = Lighting:FindFirstChildOfClass("Sky")
+				if not sky then
+					sky = Instance.new("Sky")
+					sky.Parent = Lighting
+				end
+				for k, v in pairs(preset) do
+					pcall(function()
+						if k == "StarCount" then
+							sky.StarCount = v
+						elseif k == "SunAngularSize" then
+							Lighting.SunAngularSize = v
+						elseif k == "MoonAngularSize" then
+							Lighting.MoonAngularSize = v
+						elseif k == "SunTextureId" then
+							-- Lighting may not support; try sky
+							pcall(function() sky.SunTextureId = v end)
+						elseif k == "MoonTextureId" then
+							pcall(function() sky.MoonTextureId = v end)
+						else
+							sky[k] = v
+						end
+					end)
+				end
+				S.skyboxName = name
+			end)
+		end
+		env._applyKiciaSkybox = applyKiciaSkybox
+
 		-- ============================================================
 		-- Obsidian UI (deividcomsono/Obsidian / Linoria-style)
 		-- Primary menu — legacy ScreenGui kept for popups (skin/sky/config)
@@ -6552,7 +6899,7 @@ env._pageUI = {
 
 			local Window = Library:CreateWindow({
 				Title = "anti enhancement",
-				Footer = "v0.2.8.5  |  discord.gg/6pH3NGVtm",
+				Footer = "v0.2.8.6  |  discord.gg/6pH3NGVtm",
 				NotifySide = "Right",
 				ShowCustomCursor = true,
 				AutoShow = true,
@@ -6659,7 +7006,7 @@ env._pageUI = {
 					if env._riv_startRagebot then env._riv_startRagebot(v) end
 				end,
 			}):AddKeyPicker("RagebotKey", {
-				Default = "None",
+				Default = "R",
 				Mode = "Toggle",
 				Text = "Ragebot",
 				SyncToggleState = true,
@@ -6667,8 +7014,8 @@ env._pageUI = {
 
 			CombatRight:AddSlider("RageStability", {
 				Text = "Stability",
-				Default = math.floor((tonumber(S.ragebotStability) or 0.15) * 100),
-				Min = 1, Max = 150, Rounding = 0, Suffix = "%",
+				Default = math.floor((tonumber(S.ragebotStability) or 0) * 100),
+				Min = 0, Max = 150, Rounding = 0, Suffix = "%",
 				Callback = function(v)
 					S.ragebotStability = v / 100
 					env._ragebotStability = S.ragebotStability
@@ -6677,7 +7024,7 @@ env._pageUI = {
 
 			CombatRight:AddSlider("RageShootFrames", {
 				Text = "Shoot Frames",
-				Default = tonumber(S.ragebotShootFrames) or 1,
+				Default = tonumber(S.ragebotShootFrames) or 3,
 				Min = 1, Max = 10, Rounding = 0,
 				Callback = function(v)
 					S.ragebotShootFrames = v
@@ -6740,11 +7087,18 @@ env._pageUI = {
 				end,
 			}):AddKeyPicker("ESPKey", { Default = "None", Mode = "Toggle", Text = "ESP", SyncToggleState = true })
 
-			VisLeft:AddToggle("ESPName", { Text = "Enemy Name", Default = S.espEnemyName ~= false, Callback = function(v) S.espEnemyName = v end })
+			VisLeft:AddToggle("ESPName", { Text = "Enemy Name", Default = S.espEnemyName ~= false, Callback = function(v) S.espEnemyName = v; S.namesOn = v end })
 			VisLeft:AddToggle("ESPDist", { Text = "Enemy Distance", Default = S.espEnemyDistance == true, Callback = function(v) S.espEnemyDistance = v end })
 			VisLeft:AddToggle("ESPBox", { Text = "Enemy Box", Default = S.espBox == true or S.espEnemyBox == true, Callback = function(v) S.espBox = v; S.espEnemyBox = v end })
-			VisLeft:AddToggle("ESPHealth", { Text = "Enemy Health", Default = S.espEnemyHealth == true, Callback = function(v) S.espEnemyHealth = v end })
+			VisLeft:AddToggle("ESPHealth", { Text = "Enemy Health", Default = S.espEnemyHealth == true, Callback = function(v) S.espEnemyHealth = v; S.healthOn = v end })
 			VisLeft:AddToggle("ESPWeapon", { Text = "Held Weapon", Default = S.espHeldWeapon == true, Callback = function(v) S.espHeldWeapon = v end })
+			VisLeft:AddToggle("ESPRank", { Text = "Enemy Rank", Default = S.espEnemyRank == true, Callback = function(v) S.espEnemyRank = v end })
+			VisLeft:AddToggle("ESPWinstreak", { Text = "Enemy Winstreak", Default = S.espEnemyWinstreak == true, Callback = function(v) S.espEnemyWinstreak = v end })
+			VisLeft:AddToggle("ESPNumber", { Text = "Number Enemy", Default = S.espNumberEnemy == true, Callback = function(v) S.espNumberEnemy = v end })
+			VisLeft:AddToggle("ESPDeflect", { Text = "Enemy Deflecting", Default = S.espEnemyDeflecting == true, Callback = function(v) S.espEnemyDeflecting = v end })
+			VisLeft:AddToggle("ESPGeometry", { Text = "Geometry / Chams", Default = S.espGeometry == true, Callback = function(v) S.espGeometry = v end })
+			VisLeft:AddToggle("ESPTracer", { Text = "Tracers", Default = S.espTracer == true, Callback = function(v) S.espTracer = v end })
+			VisLeft:AddToggle("ESPSkeleton", { Text = "Skeleton", Default = S.espSkeleton == true, Callback = function(v) S.espSkeleton = v end })
 
 			VisRight:AddButton({
 				Text = "Open Screen Effects",
@@ -6790,18 +7144,78 @@ env._pageUI = {
 				end,
 			})
 
+			
+			-- ---- World (Kicia skyboxes in-list) ----
+			local WorldLeft = Tabs.World:AddGroupbox({ Side = "Left", Name = "Skybox", IconName = "cloud" })
+			do
+				local names = {}
+				for n in pairs(KICIA_SKYBOXES or {}) do
+					table.insert(names, n)
+				end
+				table.sort(names)
+				if #names == 0 then names = { "GreenHaze", "Space2", "Galaxy", "Nebula" } end
+				WorldLeft:AddDropdown("SkyboxPreset", {
+					Values = names,
+					Default = 1,
+					Text = "Skybox Preset (Kicia)",
+					Searchable = true,
+					Callback = function(Value)
+						pcall(function()
+							if env._applyKiciaSkybox then env._applyKiciaSkybox(Value) end
+						end)
+					end,
+				})
+				WorldLeft:AddButton({
+					Text = "Apply Selected Skybox",
+					Func = function()
+						local v = Options.SkyboxPreset and Options.SkyboxPreset.Value
+						if v then
+							pcall(function() env._applyKiciaSkybox(v) end)
+						end
+					end,
+				})
+				WorldLeft:AddButton({
+					Text = "Reset Skybox",
+					Func = function()
+						pcall(function()
+							local sky = Lighting:FindFirstChildOfClass("Sky")
+							if sky then sky:Destroy() end
+						end)
+					end,
+				})
+			end
+
 			-- ---- Character ----
 			local CharLeft = Tabs.Character:AddGroupbox({ Side = "Left", Name = "Movement", IconName = "person-standing" })
 			CharLeft:AddToggle("Speed", {
 				Text = "Speed",
-				Default = S.speedOn == true,
-				Callback = function(v) S.speedOn = v end,
+				Default = S.walkOn == true,
+				Callback = function(v)
+					S.walkOn = v
+					S.speedOn = v
+					pcall(function()
+						local char = player.Character
+						local hum = char and char:FindFirstChildOfClass("Humanoid")
+						if hum then
+							hum.WalkSpeed = v and (tonumber(S.walkSpeed) or 16) or 16
+						end
+					end)
+				end,
 			}):AddKeyPicker("SpeedKey", { Default = "None", Mode = "Toggle", Text = "Speed", SyncToggleState = true })
 			CharLeft:AddSlider("WalkSpeed", {
 				Text = "Walk Speed",
 				Default = tonumber(S.walkSpeed) or 16,
 				Min = 16, Max = 200, Rounding = 0,
-				Callback = function(v) S.walkSpeed = v end,
+				Callback = function(v)
+					S.walkSpeed = v
+					if S.walkOn or S.speedOn then
+						pcall(function()
+							local char = player.Character
+							local hum = char and char:FindFirstChildOfClass("Humanoid")
+							if hum then hum.WalkSpeed = v end
+						end)
+					end
+				end,
 			})
 			CharLeft:AddToggle("Noclip", {
 				Text = "Noclip",
@@ -6995,7 +7409,7 @@ env._pageUI = {
 
 			Library:Notify({
 				Title = "anti enhancement",
-				Description = "v0.2.8.5 Obsidian UI loaded",
+				Description = "v0.2.8.6 Obsidian UI loaded",
 				Time = 4,
 			})
 
@@ -7005,7 +7419,7 @@ env._pageUI = {
 		end)
 
 
-		print("anti-enhancement v0.2.8.5 Enhanced & Loaded Successfully! (Obsidian UI + Silent Aim + Skin + Spoof + Loadout)")
+		print("anti-enhancement v0.2.8.6 Enhanced & Loaded Successfully! (Obsidian UI + Silent Aim + Skin + Spoof + Loadout)")
 	end)
 end
 
@@ -7045,7 +7459,7 @@ else
 	keyTitle.Position = UDim2.fromOffset(0, 10)
 	keyTitle.BackgroundTransparency = 1
 	keyTitle.RichText = true
-	keyTitle.Text = '<font color="rgb(100,180,255)">anti enhancement Key System (anti enhancement v0.2.8.5)</font>'
+	keyTitle.Text = '<font color="rgb(100,180,255)">anti enhancement Key System (anti enhancement v0.2.8.6)</font>'
 	keyTitle.TextSize, keyTitle.Font = 13, Enum.Font.Code
 	keyTitle.TextXAlignment = Enum.TextXAlignment.Center
 	keyTitle.Parent = keyFrame
