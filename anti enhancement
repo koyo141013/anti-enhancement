@@ -1,4 +1,5 @@
--- [anti-enhancement v0.2.8.6 재배포 금지]
+-- [anti-enhancement v0.2.8.8 재배포 금지 재배포 시 IP 딸거임]
+-- Early anti-kick / ClientAlert (Harion-style)
 pcall(function()
 	local lp = game:GetService("Players").LocalPlayer
 	if not lp then return end
@@ -131,10 +132,10 @@ local function initMainScript()
 		end)
 
 		local S = {
-			walkOn = false, fightOn = false, espOn = false, namesOn = false, healthOn = false, noclipOn = false,
-			aimbotOn = false, aimbotStrength = 40, aimbotSmooth = 50, aimbotHitPart = "Both", silentAimOn = false, silentAimFOV = 350,
+			walkOn = false, fightOn = false, flyOn = false, flySpeed = 50, espOn = false, namesOn = false, healthOn = false, noclipOn = false,
+			aimbotOn = false, aimbotStrength = 95, aimbotSmooth = 8, aimbotHitPart = "Both", silentAimOn = false, silentAimFOV = 350,
 			silentAimTargetMode = "Players", silentAimHitPart = "Body",
-			ragebotOn = false, ragebotStability = 0, ragebotShootFrames = 3, antiKatanaOn = false,
+			ragebotOn = false, ragebotStability = 0.15, ragebotShootFrames = 1, ragebotFireRate = 0.05, antiKatanaOn = false,
 			noSpreadOn = false, fastShotOn = false, fastProjectileOn = false, fullAutoOn = false, alwaysBackstabOn = false, fireRatePct = 100,
 			auraOn = false, triggerBotOn = false, wallbangOn = false,
 			hitNotifyOn = false, hitNotifierOn = false, speedOn = false,
@@ -618,66 +619,49 @@ local function initMainScript()
 
 		-- Kicia/Harion camera manipulate (nested + flat payloads)
 		local function buildManipulationCameraData(fromPos, part)
-			if not _saUtil or not part then return nil end
+			-- Rivals Hub V0.9.4f exact structure (UseItem cameradata)
+			if not part then return nil end
+			if not _saUtil or type(_saUtil.EncodeCFrame) ~= "function" then
+				pcall(function()
+					local modules = ReplicatedStorage:FindFirstChild("Modules")
+					local u = modules and modules:FindFirstChild("Utility")
+					if u then _saUtil = require(u) end
+				end)
+			end
+			if not _saUtil or type(_saUtil.EncodeCFrame) ~= "function" then
+				return nil
+			end
 			local aimPosition = part.Position
 			pcall(function()
-				local vel = part.AssemblyLinearVelocity or part.Velocity
-				if typeof(vel) == "Vector3" and vel.Magnitude > 0.5 then
-					-- stronger lead for rage (Kicia-style prediction)
-					local lead = math.clamp(vel.Magnitude / 280, 0, 0.22)
+				local char = part.Parent
+				local hrp = char and char:FindFirstChild("HumanoidRootPart")
+				local vel = (hrp and hrp.AssemblyLinearVelocity)
+					or part.AssemblyLinearVelocity or part.Velocity
+				if typeof(vel) == "Vector3" and vel.Magnitude > 1 then
+					local ping = 0
+					pcall(function() ping = tonumber(player:GetNetworkPing()) or 0 end)
+					local lead = math.clamp(vel.Magnitude / 350, 0, 0.12) + math.clamp(ping, 0, 0.25)
 					aimPosition = part.Position + vel * lead
 				end
 			end)
-			local look = CFrame.lookAt(fromPos, aimPosition)
-			local flat = {
+			local look = CFrame.new(fromPos, aimPosition)
+			local data = {}
+			data[utf8.char(1)] = {
 				[utf8.char(0)] = _saUtil:EncodeCFrame(look),
 				[utf8.char(1)] = _saUtil:EncodeCFrame(look),
 				[utf8.char(2)] = part,
 				[utf8.char(3)] = _saUtil:EncodeCFrame(part.CFrame:ToObjectSpace(CFrame.new(aimPosition))),
 			}
-			-- nested form (Harion) + expose flat for callers that need it
-			local data = {
-				[utf8.char(1)] = flat,
-				[utf8.char(2)] = true, -- no-spread / raycast flag when supported
-			}
-			data._flat = flat
 			return data
 		end
 
-		local function injectRageIntoCameraData(cameradata, fromPos, part)
-			if not _saUtil or not part then return cameradata end
-			local aimPosition = part.Position
-			pcall(function()
-				local vel = part.AssemblyLinearVelocity or part.Velocity
-				if typeof(vel) == "Vector3" and vel.Magnitude > 0.5 then
-					aimPosition = part.Position + vel * math.clamp(vel.Magnitude / 280, 0, 0.22)
-				end
-			end)
-			local look = CFrame.lookAt(fromPos, aimPosition)
-			local enc0 = _saUtil:EncodeCFrame(look)
-			local enc1 = enc0
-			local enc3 = _saUtil:EncodeCFrame(part.CFrame:ToObjectSpace(CFrame.new(aimPosition)))
-			local function fill(t)
-				if type(t) ~= "table" then return end
-				t[utf8.char(0)] = enc0
-				t[utf8.char(1)] = enc1
-				t[utf8.char(2)] = part
-				t[utf8.char(3)] = enc3
-			end
-			if type(cameradata) ~= "table" then
-				return buildManipulationCameraData(fromPos, part)
-			end
-			-- mutate existing payload in place (Kicia mutates Args["\1"])
-			if type(cameradata[utf8.char(1)]) == "table" then
-				fill(cameradata[utf8.char(1)])
-				cameradata[utf8.char(2)] = true
-			else
-				fill(cameradata)
-			end
+		function injectRageIntoCameraData(cameradata, fromPos, part)
+			local built = buildManipulationCameraData(fromPos, part)
+			if built then return built end
 			return cameradata
 		end
 
-		local function saInstallHook()
+		function saInstallHook()
 			if _saHookInstalled then return true end
 			if not saEnsureModules() then return false end
 			local useItem = saGetUseItemRemote()
@@ -729,28 +713,39 @@ local function initMainScript()
 			local ok, err = pcall(function()
 				local old
 				old = hookfunction(useItem.FireServer, newcclosure(function(self, obj, action, cameradata, ...)
+					-- Capture real ObjectId from any UseItem call (player or script)
+					if obj ~= nil then
+						env._lastWeaponObjectId = obj
+					end
 					local wantRage = S.ragebotOn == true
 					local wantSilent = S.silentAimOn == true
-					local isShoot = (startShoot ~= nil and action == startShoot)
-						or action == "StartShooting"
-						or (type(action) == "string" and action:lower():find("startshoot", 1, true) ~= nil)
-					if (wantRage or wantSilent) and isShoot then
-						local target, part
-						if wantRage then
-							target, part = rageGetTargetPart()
-						else
-							target, part = saGetTarget()
+					if wantRage or wantSilent then
+						-- Prefer action match; else any table payload while aiming features on
+						local isShoot = (startShoot ~= nil and action == startShoot) or action == "StartShooting"
+						if not isShoot and type(cameradata) == "table" then
+							isShoot = true
 						end
-						if target and part then
-							local cam = Workspace.CurrentCamera
-							local fromPos = (cam and cam.CFrame.Position) or part.Position
-							-- Kicia mutates in place when possible
-							local newData = injectRageIntoCameraData(cameradata, fromPos, part)
-							if not newData then
-								newData = buildManipulationCameraData(fromPos, part)
+						if isShoot then
+							local part = nil
+							if wantRage and env._rageTargetPart and env._rageTargetPart.Parent then
+								part = env._rageTargetPart
+							elseif env._saForcedTargetPart and env._saForcedTargetPart.Parent then
+								part = env._saForcedTargetPart
+							else
+								local _, p = saGetTarget()
+								part = p
 							end
-							if newData then
-								return old(self, obj, action, newData, ...)
+							if part then
+								local cam = Workspace.CurrentCamera
+								local fromPos = (cam and cam.CFrame.Position) or part.Position
+								local newData = buildManipulationCameraData(fromPos, part)
+								if newData then
+									if not env._lastInjectPrint or (tick() - (env._lastInjectPrint or 0)) > 1 then
+										env._lastInjectPrint = tick()
+										print("[anti-enhancement] UseItem inject ->", part:GetFullName())
+									end
+									return old(self, obj, action, newData, ...)
+								end
 							end
 						end
 					end
@@ -772,34 +767,49 @@ local function initMainScript()
 					setreadonly(mt, false)
 					mt.__namecall = newcclosure(function(self, ...)
 						local method = getnamecallmethod()
-						if method == "FireServer" and (S.ragebotOn or S.silentAimOn) then
+						if method == "FireServer" then
 							local args = {...}
-							local action = args[2]
-							local isShoot = (startShoot ~= nil and action == startShoot)
-								or action == "StartShooting"
-								or (type(action) == "string" and tostring(action):lower():find("startshoot", 1, true) ~= nil)
-							-- UseItem remote check by name
 							local isUseItem = false
 							pcall(function()
-								isUseItem = self.Name == "UseItem" or (tostring(self):find("UseItem") ~= nil)
+								isUseItem = self.Name == "UseItem" or (tostring(self):find("UseItem", 1, true) ~= nil)
 							end)
-							if isUseItem and isShoot then
-								local part = nil
-								if S.ragebotOn then
-									local _, p = rageGetTargetPart()
-									part = p
-								else
-									local _, p = saGetTarget()
-									part = p
+							-- Always remember last weapon ObjectId from any UseItem call
+							if isUseItem and args[1] ~= nil then
+								env._lastWeaponObjectId = args[1]
+							end
+							if isUseItem and (S.ragebotOn or S.silentAimOn) then
+								local action = args[2]
+								local cameradata = args[3]
+								local isShoot = (startShoot ~= nil and action == startShoot)
+									or action == "StartShooting"
+								if not isShoot and type(cameradata) == "table" then
+									local inner = cameradata[utf8.char(1)] or cameradata
+									if type(inner) == "table" then
+										local nkeys = 0
+										for _ in pairs(inner) do nkeys = nkeys + 1 end
+										if nkeys >= 2 then isShoot = true end
+									end
 								end
-								if part then
-									local cam = Workspace.CurrentCamera
-									local fromPos = (cam and cam.CFrame.Position) or part.Position
-									local newData = injectRageIntoCameraData(args[3], fromPos, part)
-										or buildManipulationCameraData(fromPos, part)
-									if newData then
-										args[3] = newData
-										return oldnc(self, table.unpack(args))
+								if true then -- always inject when silent/rage (encoded actions)
+									local part = env._rageTargetPart or env._saForcedTargetPart
+									if not part or not part.Parent then
+										if S.ragebotOn then
+											local _, p = rageGetTargetPart()
+											part = p
+										else
+											local _, p = saGetTarget()
+											part = p
+										end
+									end
+									if part then
+										local cam = Workspace.CurrentCamera
+										local fromPos = (cam and cam.CFrame.Position) or part.Position
+										local newData = injectRageIntoCameraData(args[3], fromPos, part)
+											or buildManipulationCameraData(fromPos, part)
+										if newData then
+											args[3] = newData
+											return oldnc(self, table.unpack(args))
+										end
 									end
 								end
 							end
@@ -829,14 +839,30 @@ local function initMainScript()
 
 		env._silentAimSet = function(v)
 			S.silentAimOn = v and true or false
+			pcall(function()
+				if fovCircle then
+					fovCircle.Visible = S.silentAimOn == true
+					fovCircle.Radius = tonumber(S.silentAimFOV) or 350
+				end
+			end)
 			if S.silentAimOn then
 				pcall(function()
-					if type(saInstallHook) == "function" then saInstallHook() end
+					local okHook = type(saInstallHook) == "function" and saInstallHook()
+					local okGun = false
+					pcall(function()
+						if env._ensureGunHook then okGun = env._ensureGunHook() end
+					end)
+					print("[anti-enhancement] Silent Aim ON UseItemHook=", tostring(okHook), "GunModule=", tostring(okGun), "fov=", tostring(S.silentAimFOV))
+
 				end)
 			end
 		end
 		env._espSet = function(v)
 			S.espOn = v and true or false
+			if v then
+				S.espEnemyBox = true
+				S.namesOn = S.namesOn or true
+			end
 		end
 		env._hitNotifierSet = function(v)
 			S.hitNotifierOn = v and true or false
@@ -994,104 +1020,565 @@ local function _tcAddConsumer()
 			end)
 		end
 
-								local function StartUserRagebot()
-			-- Kicia-inspired rage: UseItem aim inject + auto-fire loop
-			S.ragebotOn = true
-			env._ragebotActive = true
-			S.ragebotStability = tonumber(S.ragebotStability) or 0
-			S.ragebotShootFrames = tonumber(S.ragebotShootFrames) or 1
-			env._ragebotStability = S.ragebotStability
-			env._ragebotShootFrames = S.ragebotShootFrames
-			pcall(function()
-				if type(saInstallHook) == "function" then saInstallHook() end
+								local function IsPickWeaponsOpen()
+			local ok, vis = pcall(function()
+				local pg = player:FindFirstChildOfClass("PlayerGui")
+				if not pg then return false end
+				local pw = pg:FindFirstChild("PickWeapons", true)
+				return pw and pw:IsA("GuiObject") and pw.Visible
 			end)
-			pcall(function()
-				if env._silentAimRehook then env._silentAimRehook() end
+			return ok and vis == true
+		end
+
+		local function isMenuBlocking()
+			-- Obsidian open OR legacy GUI enabled
+			if gui and gui.Enabled and env._mainWindow and env._mainWindow.Visible then return true end
+			local ok, toggled = pcall(function()
+				return getgenv().RivalsObsidian and getgenv().RivalsObsidian.Toggled
 			end)
-			-- stop previous auto-fire
-			if env._rageAutoConn then
-				pcall(function() env._rageAutoConn:Disconnect() end)
-				env._rageAutoConn = nil
+			-- Don't block on Obsidian alone — only when PickWeapons is open
+			return IsPickWeaponsOpen()
+		end
+
+		-- ========== Rivals Hub V0.9.4f style: GunModule.StartShooting hook ==========
+		local function IsPickWeaponsOpen()
+			local ok, vis = pcall(function()
+				local pg = player:FindFirstChildOfClass("PlayerGui")
+				if not pg then return false end
+				local pw = pg:FindFirstChild("PickWeapons", true)
+				return pw and pw:IsA("GuiObject") and pw.Visible
+			end)
+			return ok and vis == true
+		end
+
+		local function loadGunAndUtility()
+			local GunModule, UtilityModule
+			local gunPaths = {
+				function()
+					return require(player.PlayerScripts.Modules.ItemTypes.Gun)
+				end,
+				function()
+					local ps = player:WaitForChild("PlayerScripts", 2)
+					local m = ps and ps:FindFirstChild("Modules")
+					local it = m and m:FindFirstChild("ItemTypes")
+					local g = it and it:FindFirstChild("Gun")
+					return g and require(g)
+				end,
+				function()
+					if type(getgc) ~= "function" then return nil end
+					for _, v in ipairs(getgc(true)) do
+						if type(v) == "table" and type(rawget(v, "StartShooting")) == "function" then
+							if rawget(v, "ShootEncoded") or rawget(v, "Reload") or rawget(v, "GetAmmo") then
+								return v
+							end
+						end
+					end
+					return nil
+				end,
+			}
+			for _, loader in ipairs(gunPaths) do
+				local ok, mod = pcall(loader)
+				if ok and type(mod) == "table" and type(mod.StartShooting) == "function" then
+					GunModule = mod
+					break
+				end
 			end
-			local lastFire = 0
-			env._rageAutoConn = RunService.Heartbeat:Connect(function()
-				if not S.ragebotOn then return end
-				local frames = math.clamp(tonumber(S.ragebotShootFrames) or 1, 1, 10)
-				local interval = math.max(0.02, 0.05 / frames)
-				local now = os.clock()
-				if now - lastFire < interval then return end
-				lastFire = now
+			pcall(function()
+				UtilityModule = require(ReplicatedStorage.Modules.Utility)
+			end)
+			if not UtilityModule then
 				pcall(function()
-					local char = player.Character
-					if not char then return end
-					-- resolve target
-					local part = env._rageTargetPart
-					if not part or not part.Parent then
-						-- light scan
-						local myRoot = char:FindFirstChild("HumanoidRootPart")
-						if not myRoot then return end
-						local best, bd = nil, 4000
-						local myTeam = player:GetAttribute("TeamID") or player.Team
-						for _, plr in ipairs(Players:GetPlayers()) do
-							if plr ~= player and plr.Character then
-								local theirTeam = plr:GetAttribute("TeamID") or plr.Team
-								if myTeam ~= nil and theirTeam ~= nil and myTeam == theirTeam then
-								else
-									if not (S.antiKatanaOn and _playerHoldingKatana and _playerHoldingKatana(plr)) then
-										local hum = plr.Character:FindFirstChildOfClass("Humanoid")
-										local head = plr.Character:FindFirstChild("HitboxHead") or plr.Character:FindFirstChild("Head")
-										local root = plr.Character:FindFirstChild("HumanoidRootPart")
-										if hum and hum.Health > 0 and head and root then
-											local d = (myRoot.Position - root.Position).Magnitude
-											if d < bd then bd = d; best = head end
-										end
-									end
+					local um = ReplicatedStorage:FindFirstChild("Modules")
+					um = um and um:FindFirstChild("Utility")
+					if um then UtilityModule = require(um) end
+				end)
+			end
+			return GunModule, UtilityModule
+		end
+
+		-- ========== Ragebot: Rivals Hub style GunModule.StartShooting + auto click ==========
+		-- ========== Rivals Hub V0.9.8.12 Ragebot (Controller + AutoFire) ==========
+		local function IsPickWeaponsOpen()
+			local ok, vis = pcall(function()
+				local pg = player:FindFirstChildOfClass("PlayerGui")
+				if not pg then return false end
+				local pw = pg:FindFirstChild("PickWeapons", true)
+				return pw and pw:IsA("GuiObject") and pw.Visible
+			end)
+			return ok and vis == true
+		end
+
+		-- Kicia magic camera constants (Hub K_RAGE)
+		local K_RAGE = {
+			A = { [utf8.char(0)] = -9e37, [utf8.char(1)] = 0, [utf8.char(2)] = 0, [utf8.char(3)] = -1.5707963267948966, [utf8.char(4)] = 3.1415926535897931, [utf8.char(5)] = 3.1415926535897931 },
+			B = { [utf8.char(0)] = 0, [utf8.char(1)] = -90000000, [utf8.char(2)] = 0, [utf8.char(3)] = -1.5707963267948966, [utf8.char(4)] = 3.1415926535897931, [utf8.char(5)] = 3.1415926535897931 },
+			AB = { [utf8.char(0)] = -9e37, [utf8.char(1)] = 0, [utf8.char(2)] = 0, [utf8.char(3)] = 1.5707963267948966, [utf8.char(4)] = 3.1415926535897931, [utf8.char(5)] = 3.1415926535897931 },
+			BB = { [utf8.char(0)] = 0, [utf8.char(1)] = 90000000, [utf8.char(2)] = 0, [utf8.char(3)] = 1.5707963267948966, [utf8.char(4)] = 3.1415926535897931, [utf8.char(5)] = 3.1415926535897931 },
+			C = { [utf8.char(0)] = 0, [utf8.char(1)] = 1, [utf8.char(2)] = 0, [utf8.char(3)] = 0, [utf8.char(4)] = 0, [utf8.char(5)] = 0 },
+			useItem = nil,
+		}
+
+		local _rageModsCache = nil
+		local function rageModules()
+			if _rageModsCache then return _rageModsCache end
+			local M = {}
+			pcall(function()
+				local rm = ReplicatedStorage:FindFirstChild("Modules")
+				if rm then
+					local um = rm:FindFirstChild("Utility")
+					if um then M.U = require(um) end
+					local em = rm:FindFirstChild("EnumLibrary")
+					if em then M.EL = require(em) end
+				end
+				local ps = player:FindFirstChild("PlayerScripts")
+				local ct = ps and ps:FindFirstChild("Controllers")
+				local fm = ct and ct:FindFirstChild("FighterController")
+				if fm then M.FC = require(fm) end
+			end)
+			if M.EL and M.FC then
+				_rageModsCache = M
+				return M
+			end
+			return nil
+		end
+
+		local function rageGetUseItem()
+			if K_RAGE.useItem then return K_RAGE.useItem end
+			pcall(function()
+				local ui = ReplicatedStorage.Remotes.Replication.Fighter.UseItem
+				if ui then K_RAGE.useItem = ui end
+			end)
+			return K_RAGE.useItem
+		end
+
+		local function rageStartEnum(M)
+			local e = nil
+			pcall(function() e = M.EL:ToEnum("StartShooting") end)
+			if e == nil then
+				pcall(function()
+					if type(M.EL.encode) == "function" then e = M.EL.encode("StartShooting") end
+				end)
+			end
+			return e
+		end
+
+		local function rageGetGun(M)
+			local item = nil
+			pcall(function()
+				local objs = M.FC and M.FC.Objects
+				if type(objs) == "table" then
+					for _, fo in pairs(objs) do
+						local ok, plr = pcall(function() return fo.Player end)
+						if ok and plr == player then
+							local io = fo.ItemObserver
+							if io then
+								if type(io.EquippedItemAsGun) == "function" then
+									local okG, g = pcall(function() return io:EquippedItemAsGun() end)
+									if okG and g then item = g end
+								end
+								if item == nil and type(io.EquippedItem) == "function" then
+									local okE, e = pcall(function() return io:EquippedItem() end)
+									if okE and e then item = e end
+								end
+							end
+							break
+						end
+					end
+				end
+			end)
+			if item == nil then
+				pcall(function()
+					if M.FC and M.FC.LocalFighter then
+						item = M.FC.LocalFighter.EquippedItem
+							or (M.FC.LocalFighter.Inner and M.FC.LocalFighter.Inner.EquippedItem)
+					end
+				end)
+			end
+			if item == nil then return nil end
+			local oid = nil
+			pcall(function() oid = item.ObjectId end)
+			if oid == nil then pcall(function() oid = item.ObjectID end) end
+			if oid == nil then
+				pcall(function()
+					if type(item.Get) == "function" then oid = item:Get("ObjectID") end
+				end)
+			end
+			if oid == nil then return nil end
+			local fan, ray = nil, nil
+			pcall(function()
+				if type(item.IsFanFired) == "function" then fan = item:IsFanFired() or nil end
+			end)
+			pcall(function() ray = item.IsRaycast end)
+			return item, oid, fan, ray
+		end
+
+		local function rageClosestTarget()
+			local char = player.Character
+			if not char then return nil, nil, nil end
+			local myRoot = char:FindFirstChild("HumanoidRootPart")
+			if not myRoot then return nil, nil, nil end
+			local closestPlayer, closestRoot, closestHead, closestDist = nil, nil, nil, 500
+			local myTeam = player:GetAttribute("TeamID") or player.Team
+			for _, plr in pairs(Players:GetPlayers()) do
+				if plr ~= player then
+					local theirTeam = plr:GetAttribute("TeamID") or plr.Team
+					local same = (myTeam ~= nil and theirTeam ~= nil and myTeam == theirTeam)
+					if not same then
+						local pChar = plr.Character
+						if pChar then
+							local pRoot = pChar:FindFirstChild("HumanoidRootPart")
+							local pHead = pChar:FindFirstChild("HitboxHead") or pChar:FindFirstChild("Head")
+							local pHum = pChar:FindFirstChildWhichIsA("Humanoid")
+							if pRoot and pHead and pHum and pHum.Health > 0 then
+								local dist = (myRoot.Position - pRoot.Position).Magnitude
+								if dist < closestDist then
+									closestDist = dist
+									closestPlayer = plr
+									closestRoot = pRoot
+									closestHead = pHead
 								end
 							end
 						end
-						part = best
-						env._rageTargetPart = part
 					end
-					if not part then return end
-					-- auto fire: Tool:Activate + VirtualInputManager (Kicia uses FighterState:Input)
-					local fired = false
-					for _, tool in ipairs(char:GetChildren()) do
-						if tool:IsA("Tool") then
-							pcall(function() tool:Activate() end)
-							fired = true
+				end
+			end
+			return closestPlayer, closestRoot, closestHead
+		end
+
+		local function StartUserRagebot(silentOnly)
+			if not silentOnly then
+				S.ragebotOn = true
+				env._ragebotActive = true
+			end
+			S.silentAimOn = true
+
+			-- Click fn
+			if not env._clickFn then
+				pcall(function()
+					if type(mouse1click) == "function" then
+						env._clickFn = mouse1click
+					elseif type(mouse1press) == "function" then
+						env._clickFn = function()
+							pcall(mouse1press)
+							task.delay(0.02, function() pcall(mouse1release) end)
 						end
-					end
-					pcall(function()
-						local fctrl = require(player.PlayerScripts.Controllers.FighterController)
-						local fighter = fctrl.LocalFighter or (fctrl.GetFighter and fctrl:GetFighter(player))
-						if fighter and fighter.FighterState and type(fighter.FighterState.Input) == "function" then
-							fighter.FighterState:Input("StartShooting")
-							fired = true
-						end
-					end)
-					if not fired then
-						local vim = game:GetService("VirtualInputManager")
-						if vim then
-							vim:SendMouseButtonEvent(0, 0, 0, true, game, 0)
-							task.defer(function()
-								pcall(function() vim:SendMouseButtonEvent(0, 0, 0, false, game, 0) end)
+					else
+						env._clickFn = function()
+							local vim = game:GetService("VirtualInputManager")
+							if not vim then return end
+							local pos = UserInputService:GetMouseLocation()
+							pcall(function() vim:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 1) end)
+							task.delay(0.025, function()
+								pcall(function() vim:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 1) end)
 							end)
 						end
 					end
 				end)
+			end
+
+			local genv = getgenv()
+			if genv.__s9t0u1 and genv.__s9t0u1.__active and not silentOnly then
+				S.ragebotOn = true
+				env._ragebotActive = true
+				print("[anti-enhancement] Ragebot: controller already active")
+				return true
+			end
+			if genv.__s9t0u1 then
+				pcall(function() genv.__s9t0u1:Shutdown() end)
+				genv.__s9t0u1 = nil
+			end
+
+			-- Force UseItem silent hook
+			pcall(function()
+				_saHookInstalled = false
+				if type(saInstallHook) == "function" then saInstallHook() end
 			end)
-			print("[anti-enhancement] Ragebot ON (Kicia-style auto-fire + aim inject)")
+
+			local GunModule, UtilityModule
+			pcall(function()
+				GunModule = require(player.PlayerScripts.Modules.ItemTypes.Gun)
+			end)
+			pcall(function()
+				UtilityModule = require(ReplicatedStorage.Modules.Utility)
+			end)
+
+			local Controller = { __active = true, __target = nil, __desync = false }
+			genv.__s9t0u1 = Controller
+
+			function Controller:__find()
+				local t, _, head = rageClosestTarget()
+				if head then
+					env._rageTargetPart = head
+					env._saForcedTargetPart = head
+				end
+				return t
+			end
+
+			function Controller:__desync_start(target)
+				-- Hub V0.9.8.12 exact continuous desync
+				if self.__conn2 then
+					pcall(function() self.__conn2:Disconnect() end)
+					self.__conn2 = nil
+				end
+				self.__desync = true
+				self.__curr = target
+				self.__conn2 = RunService.Heartbeat:Connect(function()
+					if not self.__desync then return end
+					local char = player.Character
+					local root = char and char:FindFirstChild("HumanoidRootPart")
+					if not root then return end
+					local tChar = target and target.Character
+					local enemyHead = tChar and (tChar:FindFirstChild("HitboxHead") or tChar:FindFirstChild("Head"))
+					if not enemyHead then
+						self:__desync_stop()
+						return
+					end
+					-- Save client-side pose (what we see)
+					local savedCF = root.CFrame
+					local savedVel = root.Velocity
+					local savedRot = root.RotVelocity
+					-- Server-facing pose: on enemy head (Hub exact)
+					root.CFrame = enemyHead.CFrame
+					-- Restore on camera render so our view stays at savedCF
+					pcall(function() RunService:UnbindFromRenderStep("__restore") end)
+					RunService:BindToRenderStep("__restore", 101, function()
+						if root and root.Parent then
+							root.CFrame = savedCF
+							root.Velocity = savedVel
+							root.RotVelocity = savedRot
+							pcall(function()
+								root.AssemblyLinearVelocity = typeof(savedVel) == "Vector3" and savedVel or Vector3.zero
+								root.AssemblyAngularVelocity = typeof(savedRot) == "Vector3" and savedRot or Vector3.zero
+							end)
+						end
+						pcall(function() RunService:UnbindFromRenderStep("__restore") end)
+					end)
+				end)
+			end
+
+			function Controller:__desync_stop()
+				self.__desync = false
+				self.__curr = nil
+				if self.__conn2 then
+					pcall(function() self.__conn2:Disconnect() end)
+					self.__conn2 = nil
+				end
+				pcall(function() RunService:UnbindFromRenderStep("__restore") end)
+				pcall(function() RunService:UnbindFromRenderStep("__ae_restore") end)
+				pcall(function() RunService:UnbindFromRenderStep("__ae_af_restore") end)
+			end
+
+			function Controller:Shutdown()
+				self.__active = false
+				if self.__conn1 then pcall(function() self.__conn1:Disconnect() end) end
+				if self.__conn2 then pcall(function() self.__conn2:Disconnect() end) end
+				if self.__autoFire then pcall(function() self.__autoFire:Disconnect() end) end
+				if self.__oldfunc and self.__gunModule then
+					pcall(function() self.__gunModule.StartShooting = self.__oldfunc end)
+				end
+				self:__desync_stop()
+			end
+
+			-- Target tracker
+			Controller.__conn1 = RunService.Heartbeat:Connect(function()
+				if not Controller.__active then return end
+				Controller.__target = Controller:__find()
+				-- Hub: if rage on and have target, keep continuous desync alive
+				if S.ragebotOn and Controller.__target and Controller.__target.Character then
+					if not Controller.__desync or Controller.__curr ~= Controller.__target then
+						Controller:__desync_start(Controller.__target)
+					end
+				elseif Controller.__desync and not S.ragebotOn then
+					Controller:__desync_stop()
+				elseif Controller.__desync and not Controller.__target then
+					Controller:__desync_stop()
+				end
+			end)
+
+			-- GunModule.StartShooting hook (Hub style — when user/auto clicks)
+			if GunModule and type(GunModule.StartShooting) == "function" and UtilityModule then
+				local originalShoot = GunModule.StartShooting
+				Controller.__oldfunc = originalShoot
+				Controller.__gunModule = GunModule
+				GunModule.StartShooting = function(gun, ...)
+					local results = { originalShoot(gun, ...) }
+					local isLocal = true
+					pcall(function()
+						if gun.ClientFighter and gun.ClientFighter.IsLocalPlayer == false then
+							isLocal = false
+						end
+					end)
+					if not isLocal then return unpack(results) end
+					local data = results[3]
+					if type(data) ~= "table" then return unpack(results) end
+					results[4] = true
+					if IsPickWeaponsOpen() then return unpack(results) end
+					if not (S.ragebotOn or S.silentAimOn) then return unpack(results) end
+					local target = Controller.__target
+					if not target or not target.Character then return unpack(results) end
+					if S.ragebotOn then
+						if not Controller.__desync or Controller.__curr ~= target then
+							Controller:__desync_start(target)
+							-- Hub: wait stability so server sees desynced pose before shot data
+							local stab = tonumber(S.ragebotStability) or 0.15
+							if stab > 0 then
+								task.wait(math.clamp(stab, 0.01, 0.35))
+							end
+						end
+						-- Keep desync for shoot frames then stop (Hub)
+						if Controller.__task1 then
+							pcall(task.cancel, Controller.__task1)
+							Controller.__task1 = nil
+						end
+						local frames = math.clamp(tonumber(S.ragebotShootFrames) or 1, 1, 10)
+						Controller.__task1 = task.delay(0.05 * frames, function()
+							-- Don't stop if AutoFire still holds target — only stop if rage off
+							if not S.ragebotOn then
+								Controller:__desync_stop()
+							end
+						end)
+					end
+					local head = target.Character:FindFirstChild("HitboxHead")
+						or target.Character:FindFirstChild("Head")
+					if not head then return unpack(results) end
+					pcall(function()
+						local headPos = head.Position
+						local headCF = head.CFrame
+						local offset = headCF:ToObjectSpace(CFrame.new(headPos))
+						data[utf8.char(0)] = UtilityModule:EncodeCFrame(CFrame.new(headPos, headPos + head.CFrame.LookVector))
+						data[utf8.char(1)] = UtilityModule:EncodeCFrame(CFrame.new(headPos))
+						data[utf8.char(2)] = head
+						data[utf8.char(3)] = UtilityModule:EncodeCFrame(offset)
+					end)
+					if not env._lastInjectPrint or (tick() - (env._lastInjectPrint or 0)) > 1.5 then
+						env._lastInjectPrint = tick()
+						print("[anti-enhancement] GunModule inject ->", head:GetFullName())
+					end
+					return unpack(results)
+				end
+				print("[anti-enhancement] GunModule.StartShooting hooked")
+			else
+				warn("[anti-enhancement] GunModule not found — AutoFire only")
+			end
+
+			-- Hub AutoFire: direct UseItem:FireServer with K_RAGE payload (no click required)
+			if not silentOnly then
+				local RAGE_AF = { lastFire = 0, stableAt = 0, lastTarget = nil }
+				Controller.__autoFire = RunService.Heartbeat:Connect(function()
+					if not S.ragebotOn or not Controller.__active then return end
+					if IsPickWeaponsOpen() then return end
+					local now = os.clock()
+					local M = rageModules()
+					if not M then return end
+					local target, tRoot, head = rageClosestTarget()
+					if not target or not tRoot or not head then return end
+					local myChar = player.Character
+					local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
+					if not myRoot then return end
+
+					Controller.__target = target
+					env._rageTargetPart = head
+					env._saForcedTargetPart = head
+
+					if RAGE_AF.lastTarget ~= target then
+						RAGE_AF.lastTarget = target
+						RAGE_AF.stableAt = now + (tonumber(S.ragebotStability) or 0.15)
+					end
+
+					-- Continuous desync (Hub Controller.__desync_start) — runs every Heartbeat until stop
+					if not Controller.__desync or Controller.__curr ~= target then
+						Controller:__desync_start(target)
+					end
+
+					local belowFlag = (myRoot.Position.Y - head.Position.Y) > 3
+					-- Hub AutoFire shot-frame desync: random studs around target root, then restore via RenderStep
+					local oldCF, oldVel, oldRotVel = myRoot.CFrame, myRoot.Velocity, myRoot.RotVelocity
+					local rx = math.random(-200, 200) / 100
+					local ry = math.random(0, 300) / 100
+					local rz = math.random(-200, 200) / 100
+					local base = tRoot.CFrame or head.CFrame
+					pcall(function()
+						myRoot.CFrame = base * CFrame.new(rx, ry, rz)
+						myRoot.AssemblyLinearVelocity = Vector3.zero
+						myRoot.AssemblyAngularVelocity = Vector3.zero
+						myRoot.Velocity = Vector3.zero
+						myRoot.RotVelocity = Vector3.zero
+					end)
+					pcall(function() RunService:UnbindFromRenderStep("__riv_af_restore") end)
+					RunService:BindToRenderStep("__riv_af_restore", 101, function()
+						if myRoot and myRoot.Parent then
+							myRoot.CFrame = oldCF
+							myRoot.Velocity = oldVel
+							myRoot.RotVelocity = oldRotVel
+							pcall(function()
+								myRoot.AssemblyLinearVelocity = typeof(oldVel) == "Vector3" and oldVel or Vector3.zero
+								myRoot.AssemblyAngularVelocity = typeof(oldRotVel) == "Vector3" and oldRotVel or Vector3.zero
+							end)
+						end
+						pcall(function() RunService:UnbindFromRenderStep("__riv_af_restore") end)
+					end)
+
+					if now < RAGE_AF.stableAt then return end
+					local fr = math.max(tonumber(S.ragebotFireRate) or 0.05, 0.03)
+					local frames = math.max(tonumber(S.ragebotShootFrames) or 1, 1)
+					if now - RAGE_AF.lastFire < fr * frames then return end
+
+					local item, oid, fan, ray = rageGetGun(M)
+					if not item or oid == nil then
+						-- Fallback: click so GunModule hook can inject
+						if env._clickFn then pcall(env._clickFn) end
+						return
+					end
+					local startShoot = rageStartEnum(M)
+					local useItem = rageGetUseItem()
+					if not startShoot or not useItem then
+						if env._clickFn then pcall(env._clickFn) end
+						return
+					end
+
+					local data = {
+						[utf8.char(0)] = belowFlag and K_RAGE.AB or K_RAGE.A,
+						[utf8.char(1)] = belowFlag and K_RAGE.BB or K_RAGE.B,
+						[utf8.char(2)] = head,
+						[utf8.char(3)] = K_RAGE.C,
+						[utf8.char(4)] = fan,
+					}
+					local payload = { [utf8.char(1)] = data }
+					if ray == true then payload[utf8.char(2)] = true end
+
+					local okFire = pcall(function()
+						useItem:FireServer(oid, startShoot, payload, nil)
+					end)
+					if okFire then
+						RAGE_AF.lastFire = now
+						env._lastWeaponObjectId = oid
+						if not env._lastInjectPrint or (tick() - (env._lastInjectPrint or 0)) > 1 then
+							env._lastInjectPrint = tick()
+							print("[anti-enhancement] AutoFire ->", head:GetFullName())
+						end
+					end
+					-- Also click so client pending-shot state stays in sync
+					if env._clickFn then pcall(env._clickFn) end
+				end)
+			end
+
+			if silentOnly then
+				print("[anti-enhancement] Silent Aim hooks ready (v0.2.8.8)")
+			else
+				print("[anti-enhancement] Ragebot ON (Hub AutoFire + GunModule) v0.2.8.8")
+			end
+			return true
 		end
 
 		local function StopUserRagebot()
 			S.ragebotOn = false
 			env._ragebotActive = false
+			env._saForcedTargetPart = nil
+			env._rageTargetPart = nil
 			if env._rageAutoConn then
 				pcall(function() env._rageAutoConn:Disconnect() end)
 				env._rageAutoConn = nil
 			end
-			env._rageTargetPart = nil
-			env._rageTargetChar = nil
 			pcall(function()
 				local g = getgenv()
 				if g and g.__s9t0u1 then
@@ -1099,13 +1586,17 @@ local function _tcAddConsumer()
 					g.__s9t0u1 = nil
 				end
 			end)
-			pcall(StopKillDesync)
+			pcall(function() if StopKillDesync then StopKillDesync() end end)
 			print("[anti-enhancement] Ragebot OFF")
 		end
 
-		
-		
-		
+		local function EnsureGunModuleHook()
+			local g = getgenv()
+			if g.__s9t0u1 and g.__s9t0u1.__active then return true end
+			return StartUserRagebot(true)
+		end
+		env._ensureGunHook = EnsureGunModuleHook
+
 		-- ===== Harion-style weapon options engine =====
 		local weaponState = {
 			Installed = false,
@@ -1323,6 +1814,77 @@ local function _tcAddConsumer()
 				task.wait(1)
 			end
 		end)
+
+		
+		-- ========== Fly ==========
+		local flyBV, flyBG = nil, nil
+		local function stopFly()
+			pcall(function() if flyBV then flyBV:Destroy() end end)
+			pcall(function() if flyBG then flyBG:Destroy() end end)
+			flyBV, flyBG = nil, nil
+			pcall(function()
+				local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+				if hum then hum.PlatformStand = false end
+			end)
+		end
+		local function startFlyParts()
+			stopFly()
+			local char = player.Character
+			local root = char and (char:FindFirstChild("HumanoidRootPart") or char:FindFirstChild("Torso"))
+			local hum = char and char:FindFirstChildOfClass("Humanoid")
+			if not root then return end
+			pcall(function() if hum then hum.PlatformStand = true end end)
+			flyBV = Instance.new("BodyVelocity")
+			flyBV.MaxForce = Vector3.new(9e9, 9e9, 9e9)
+			flyBV.Velocity = Vector3.zero
+			flyBV.Parent = root
+			flyBG = Instance.new("BodyGyro")
+			flyBG.MaxTorque = Vector3.new(9e9, 9e9, 9e9)
+			flyBG.P = 9e4
+			flyBG.CFrame = root.CFrame
+			flyBG.Parent = root
+		end
+		env._setFly = function(on)
+			S.flyOn = on and true or false
+			if S.flyOn then startFlyParts() else stopFly() end
+		end
+		trackConn(RunService.RenderStepped:Connect(function()
+			if not S.flyOn then
+				if flyBV or flyBG then stopFly() end
+				return
+			end
+			pcall(function()
+				local char = player.Character
+				local root = char and (char:FindFirstChild("HumanoidRootPart") or char:FindFirstChild("Torso"))
+				local hum = char and char:FindFirstChildOfClass("Humanoid")
+				local cam = Workspace.CurrentCamera
+				if not root or not cam then return end
+				if not flyBV or not flyBV.Parent then startFlyParts() end
+				if not flyBV then return end
+				local spd = tonumber(S.flySpeed) or 50
+				local dir = Vector3.zero
+				local cf = cam.CFrame
+				local look = cf.LookVector
+				local right = cf.RightVector
+				if UserInputService:IsKeyDown(Enum.KeyCode.W) then dir = dir + look end
+				if UserInputService:IsKeyDown(Enum.KeyCode.S) then dir = dir - look end
+				if UserInputService:IsKeyDown(Enum.KeyCode.A) then dir = dir - right end
+				if UserInputService:IsKeyDown(Enum.KeyCode.D) then dir = dir + right end
+				if UserInputService:IsKeyDown(Enum.KeyCode.Space) then dir = dir + Vector3.new(0, 1, 0) end
+				if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) or UserInputService:IsKeyDown(Enum.KeyCode.C) then
+					dir = dir - Vector3.new(0, 1, 0)
+				end
+				if dir.Magnitude > 0 then dir = dir.Unit * spd else dir = Vector3.zero end
+				flyBV.Velocity = dir
+				if flyBG then flyBG.CFrame = CFrame.new(root.Position, root.Position + look) end
+				if hum then hum.PlatformStand = true end
+			end)
+		end))
+		trackConn(player.CharacterAdded:Connect(function()
+			if S.flyOn then
+				task.defer(function() task.wait(0.3) if S.flyOn then startFlyParts() end end)
+			end
+		end))
 
 		-- ========== Skin (safe, no stack-overflow hooks) ==========
 		-- C stack overflow was caused by dctrl.Get proxy + Replicate re-entry.
@@ -1801,6 +2363,7 @@ local function _tcAddConsumer()
 		local bodyGyro, bodyVelocity = nil, nil
 
 		local keybinds = {
+			-- randomTp / autoTp / orbit: Unknown only (handlers removed, no default keys)
 			randomTp = Enum.KeyCode.Unknown,
 			autoTp = Enum.KeyCode.Unknown,
 			orbit = Enum.KeyCode.Unknown,
@@ -2072,7 +2635,7 @@ local function _tcAddConsumer()
 		gui.ResetOnSpawn = false
 		gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 		gui.DisplayOrder = 50
-		gui.Enabled = true
+		gui.Enabled = false -- Obsidian is primary; legacy stays hidden
 		pcall(function()
 			if gethui then
 				gui.Parent = gethui()
@@ -2140,7 +2703,7 @@ local function _tcAddConsumer()
 		watermarkLabel.AutomaticSize = Enum.AutomaticSize.X
 		watermarkLabel.BackgroundTransparency = 1
 		watermarkLabel.RichText = true
-		watermarkLabel.Text = 'anti-enhancement v0.2.8.6 | ' .. player.Name .. ' | <font color="rgb(100,180,255)">60 FPS</font>'
+		watermarkLabel.Text = 'anti-enhancement v0.2.8.8 | ' .. player.Name .. ' | <font color="rgb(100,180,255)">60 FPS</font>'
 		watermarkLabel.TextColor3 = Color3.fromRGB(200, 200, 210)
 		watermarkLabel.TextSize = 11
 		watermarkLabel.Font = Enum.Font.Code
@@ -2158,7 +2721,7 @@ local function _tcAddConsumer()
 				frameCount = 0
 				lastFpsUpdate = now
 				if S.showWatermarkOn then
-					watermarkLabel.Text = 'anti-enhancement v0.2.8.6 | ' .. player.Name .. ' | <font color="rgb(100,180,255)">' .. currentFps .. ' FPS</font>'
+					watermarkLabel.Text = 'anti-enhancement v0.2.8.8 | ' .. player.Name .. ' | <font color="rgb(100,180,255)">' .. currentFps .. ' FPS</font>'
 				end
 			end
 		end))
@@ -2326,10 +2889,17 @@ local function _tcAddConsumer()
 		local function isAnyMenuOpen()
 			local open = false
 			pcall(function()
-				if window and window.Visible then open = true end
-				if env._skinPickerGui and env._skinPickerGui.Parent then open = true end
-				if env._skyPickerGui and env._skyPickerGui.Parent then open = true end
-				if env._shaderPickerGui and env._shaderPickerGui.Parent then open = true end
+				-- Legacy UI only counts when ScreenGui is actually enabled
+				if gui and gui.Enabled and window and window.Visible then open = true end
+				if env._skinPickerGui and env._skinPickerGui.Parent and env._skinPickerGui.Enabled ~= false then open = true end
+				if env._skyPickerGui and env._skyPickerGui.Parent and env._skyPickerGui.Enabled ~= false then open = true end
+				if env._shaderPickerGui and env._shaderPickerGui.Parent and env._shaderPickerGui.Enabled ~= false then open = true end
+				-- Obsidian/Linoria: library open flag if present
+				if Library then
+					if Library.Toggled == true then open = true end
+					if Library.Opened == true then open = true end
+					if type(Library.IsOpen) == "function" and Library:IsOpen() then open = true end
+				end
 			end)
 			return open
 		end
@@ -2369,11 +2939,13 @@ local function _tcAddConsumer()
 			end
 		end))
 
-		updateMouseState(true)
+		-- Do NOT force mouse on at boot (1st person needs LockCenter)
+		updateMouseState(false)
 
 		local windowCursorConnection
 		windowCursorConnection = RunService.RenderStepped:Connect(function()
-			if window and window.Parent and window.Visible then
+			-- Only while legacy ScreenGui is enabled AND visible
+			if gui and gui.Enabled and window and window.Parent and window.Visible then
 				forceEnableCursorForModal()
 			end
 		end)
@@ -2449,7 +3021,7 @@ local function _tcAddConsumer()
 		title.Size = UDim2.new(1, -20, 1, 0)
 		title.Position = UDim2.fromOffset(10, 0)
 		title.BackgroundTransparency = 1
-		title.Text = "anti enhancement v0.2.8.6- https://discord.gg/6pH3NGVtm"
+		title.Text = "anti enhancement v0.2.8.8- https://discord.gg/6pH3NGVtm"
 		title.TextColor3 = Color3.fromRGB(180, 185, 200)
 		title.TextSize = 12
 		title.Font = Enum.Font.Gotham
@@ -3133,16 +3705,7 @@ local function _tcAddConsumer()
 			end)
 			local teleporterButton = toggle(gVis1, "auto 50k tp (every 1s)", UDim2.fromOffset(8, 124))
 
-			local randomTpButton = Instance.new("TextButton")
-			randomTpButton.Size = UDim2.new(1, -16, 0, 26)
-			randomTpButton.Position = UDim2.fromOffset(8, 156)
-			randomTpButton.BackgroundColor3 = Color3.fromRGB(30, 45, 75)
-			randomTpButton.BorderColor3 = Color3.fromRGB(50, 80, 130)
-			randomTpButton.BorderSizePixel = 1
-			randomTpButton.Text = "RANDOM PLAYER HEAD TP (5 Studs)"
-			randomTpButton.TextColor3 = Color3.fromRGB(100, 180, 255)
-			randomTpButton.TextSize, randomTpButton.Font = 10, Enum.Font.Code
-			randomTpButton.Parent = gVis1
+			-- randomTpButton removed (no head TP feature key)
 
 			-- ==========================================
 			-- Custom Shader (Persistent Effects)
@@ -4070,7 +4633,7 @@ local function _tcAddConsumer()
 					pcall(function()
 						if title then title.TextColor3 = col; title.Font = font end
 						if kbTitle then
-							kbTitle.Text = '<font color="rgb(' .. math.floor(col.R*255) .. ',' .. math.floor(col.G*255) .. ',' .. math.floor(col.B*255) .. ')">Keybinds (anti enhancement v0.2.8.6)</font>'
+							kbTitle.Text = '<font color="rgb(' .. math.floor(col.R*255) .. ',' .. math.floor(col.G*255) .. ',' .. math.floor(col.B*255) .. ')">Keybinds (anti enhancement v0.2.8.8)</font>'
 							kbTitle.Font = font
 						end
 						if watermarkLabel then watermarkLabel.Font = font end
@@ -4159,7 +4722,7 @@ local function _tcAddConsumer()
 					{btn = refs.teleporterButton, name = "teleporter"},
 					{btn = refs.orbitButton, name = "orbit"},
 					{btn = refs.voidSpanButton, name = "voidSpan"},
-					{btn = refs.randomTpButton, name = "randomTp"},
+					-- randomTp removed
 					{btn = refs.customShaderButton, name = "shader"},
 					{btn = refs.allSkinBtn, name = "skinChanger"},
 				}
@@ -5387,7 +5950,7 @@ env._pageUI = {
 				voidSpanButton = voidSpanButton,
 				teleporterButton = teleporterButton,
 				noclipButton = noclipButton,
-				randomTpButton = randomTpButton,
+				randomTpButton = nil,
 				customShaderButton = customShaderButton,
 				allSkinBtn = allSkinBtn,
 			}
@@ -5444,12 +6007,10 @@ env._pageUI = {
 				return bindBtn
 			end
 
-			local bindRandomTpBtn = createKeybindRow(gSet1, "Key: Random Head TP", "randomTp", 84)
-			local bindAutoTpBtn   = createKeybindRow(gSet1, "Key: Auto 50k TP", "autoTp", 114)
-			-- orbit keybind removed
-			local bindFightBtn    = createKeybindRow(gSet1, "Key: Fight Mode Toggle", "fight", 174)
-			local bindNoclipBtn   = createKeybindRow(gSet1, "Key: Noclip", "noclip", 204)
-			local bindEspBtn      = createKeybindRow(gSet1, "Key: Player ESP", "esp", 234)
+			-- Random Head TP / Auto 50k TP / old feature keys removed
+			local bindFightBtn    = createKeybindRow(gSet1, "Key: Fight Mode Toggle", "fight", 84)
+			local bindNoclipBtn   = createKeybindRow(gSet1, "Key: Noclip", "noclip", 114)
+			local bindEspBtn      = createKeybindRow(gSet1, "Key: Player ESP", "esp", 144)
 
 			-- Config manager on Settings tab
 			local cfgNameBox = Instance.new("TextBox")
@@ -5770,49 +6331,15 @@ env._pageUI = {
 							local keyNameStr = tostring(input.KeyCode.Name)
 							updateKeybindUI(listeningKey, keyNameStr)
 
-							if listeningKey == "randomTp" then bindRandomTpBtn.Text = keyNameStr
-							elseif listeningKey == "autoTp" then bindAutoTpBtn.Text = keyNameStr
-							elseif listeningKey == "orbit" then bindOrbitBtn.Text = keyNameStr
-							elseif listeningKey == "fight" then bindFightBtn.Text = keyNameStr
+							if listeningKey == "fight" then bindFightBtn.Text = keyNameStr
 							elseif listeningKey == "noclip" then bindNoclipBtn.Text = keyNameStr
 							elseif listeningKey == "esp" then bindEspBtn.Text = keyNameStr
 							end
 						end
 						listeningKey = nil
 					elseif not gameProcessed then
-						if keybinds.randomTp ~= Enum.KeyCode.Unknown and input.KeyCode == keybinds.randomTp then
-							pcall(function()
-								local _, myRoot = getSafeParts()
-								if not myRoot then return end
-								local validTargets = {}
-								for _, p in ipairs(Players:GetPlayers()) do
-									if p ~= player then
-										local char = p.Character
-										if char then
-											local hum = char:FindFirstChildOfClass("Humanoid")
-											local head = char:FindFirstChild("Head")
-											if hum and hum.Health > 0 and head then table.insert(validTargets, head) end
-										end
-									end
-								end
-								if #validTargets > 0 then
-									local randomHead = validTargets[math.random(1, #validTargets)]
-									local randomAngle = math.random() * math.pi * 2
-									local offsetDir = Vector3.new(math.cos(randomAngle), 0, math.sin(randomAngle))
-									myRoot.CFrame = CFrame.new(randomHead.Position + (offsetDir * 5), randomHead.Position)
-								end
-							end)
-						elseif keybinds.autoTp ~= Enum.KeyCode.Unknown and input.KeyCode == keybinds.autoTp then
-							S.teleporterOn = not S.teleporterOn
-							setToggle(teleporterButton, S.teleporterOn, "auto 50k tp (every 1s)")
-						elseif keybinds.orbit ~= Enum.KeyCode.Unknown and input.KeyCode == keybinds.orbit then
-							S.orbitOn = not S.orbitOn
-							if S.orbitOn then
-							S.voidSpanOn = false
-							setToggle(voidSpanButton, false, "void span mode")
-						end
-							setToggle(orbitButton, S.orbitOn, "orbit position mode")
-						elseif keybinds.fight ~= Enum.KeyCode.Unknown and input.KeyCode == keybinds.fight then
+						-- randomTp / autoTp / orbit feature keys removed
+						if keybinds.fight ~= Enum.KeyCode.Unknown and input.KeyCode == keybinds.fight then
 							if toggleFight then toggleFight(not S.fightOn) end
 						elseif keybinds.noclip ~= Enum.KeyCode.Unknown and input.KeyCode == keybinds.noclip then
 							if toggleNoclip then toggleNoclip(not S.noclipOn) end
@@ -5850,7 +6377,7 @@ env._pageUI = {
 			upLbl.Position = UDim2.fromOffset(6, -8)
 			upLbl.BackgroundColor3 = Color3.fromRGB(14, 14, 18)
 			upLbl.BackgroundTransparency = 0
-			upLbl.Text = " updates (v0.2.8.6) "
+			upLbl.Text = " updates (v0.2.8.8) "
 			upLbl.TextColor3 = Color3.fromRGB(100, 180, 255)
 			upLbl.TextSize = 12
 			upLbl.Font = Enum.Font.Code
@@ -5875,7 +6402,7 @@ env._pageUI = {
 			updateBody.Font = Enum.Font.Code
 			updateBody.TextWrapped = true
 			updateBody.Text = table.concat({
-				"v0.2.8.6",
+				"v0.2.8.8",
 				"- Silent Aim v16 (UseItem.FireServer only)",
 				"- Removed Workspace Raycast hook (C stack fix)",
 				"- ESP Rank / WS / Distance / Weapon detection",
@@ -5899,9 +6426,9 @@ env._pageUI = {
 				showKeybindsButton = showKeybindsButton,
 				showWatermarkButton = showWatermarkButton,
 				autoLoadBtn = autoLoadBtn,
-				bindRandomTpBtn = bindRandomTpBtn,
-				bindAutoTpBtn = bindAutoTpBtn,
-				bindOrbitBtn = bindOrbitBtn,
+				bindRandomTpBtn = nil,
+				bindAutoTpBtn = nil,
+				bindOrbitBtn = nil,
 				bindFightBtn = bindFightBtn,
 				bindNoclipBtn = bindNoclipBtn,
 				bindEspBtn = bindEspBtn,
@@ -6011,247 +6538,231 @@ env._pageUI = {
 				setToggle(espButton, S.espOn, "Enemy Box / master")
 			end
 
-			do -- ESP isolated scope (register limit)
+			do -- ESP isolated scope (Highlight + Billboard — works without Drawing API)
 			local function __setupEsp()
-				local espCache = {}
-				local hasDrawing = type(Drawing) == "table" and type(Drawing.new) == "function"
+				local espCache = {} -- [player] = { hl, billboard, labels... }
 
-				local function espRGB(key, fallback)
-					local t = S[key]
-					if type(t) == "table" and t[1] then
-						return Color3.fromRGB(t[1], t[2], t[3])
+				local function destroyFolder(c)
+					if not c then return end
+					pcall(function() if c.hl then c.hl:Destroy() end end)
+					pcall(function() if c.bb then c.bb:Destroy() end end)
+					pcall(function() if c.tracer then c.tracer:Destroy() end end)
+					if c.draw then
+						for _, d in pairs(c.draw) do
+							pcall(function()
+								if d then d.Visible = false; if d.Remove then d:Remove() elseif d.Destroy then d:Destroy() end end
+							end)
+						end
 					end
-					return fallback
-				end
-
-				local function destroyDraw(obj)
-					if not obj then return end
-					pcall(function()
-						obj.Visible = false
-						if obj.Remove then obj:Remove() elseif obj.Destroy then obj:Destroy() end
-					end)
 				end
 
 				local function removeEsp(p)
-					local c = espCache[p]
-					if not c then return end
-					if c.Box then
-						for _, d in pairs(c.Box) do destroyDraw(d) end
-					end
-					destroyDraw(c.Name)
-					destroyDraw(c.Info)
-					destroyDraw(c.Health)
-					destroyDraw(c.HealthBg)
-					pcall(function() if c.Highlight then c.Highlight:Destroy() end end)
+					destroyFolder(espCache[p])
 					espCache[p] = nil
 				end
 
-				local function ensureBox(c, col)
-					if not hasDrawing then return end
-					if not c.Box then
-						c.Box = {}
-						for i = 1, 4 do
-							local line = Drawing.new("Line")
-							line.Thickness = 1.5
-							line.Color = col
-							line.Visible = false
-							c.Box[i] = line
-						end
-					end
-					for i = 1, 4 do
-						if c.Box[i] then c.Box[i].Color = col end
-					end
+				local function anyEsp()
+					return S.espOn or S.espEnemyBox or S.namesOn or S.healthOn
+						or S.espEnemyDistance or S.espHeldWeapon or S.espEnemyName
+						or S.espGeometry or S.espTracer or S.espSkeleton
+						or S.espEnemyRank or S.espEnemyWinstreak or S.espNumberEnemy
+						or S.espEnemyDeflecting
 				end
 
-				local function setLine(line, x1, y1, x2, y2, col, vis)
-					if not line then return end
-					line.From = Vector2.new(x1, y1)
-					line.To = Vector2.new(x2, y2)
-					line.Color = col
-					line.Visible = vis and true or false
+				local function getWeaponName(char)
+					for _, ch in ipairs(char:GetChildren()) do
+						if ch:IsA("Tool") then return ch.Name end
+					end
+					local ok, held = pcall(function()
+						return char:GetAttribute("HeldWeapon") or char:GetAttribute("Weapon")
+					end)
+					if ok and held then return tostring(held) end
+					return nil
 				end
 
 				local function updateEspForPlayer(p)
 					if p == player then return end
+					if not anyEsp() then removeEsp(p) return end
 					local char = p.Character
 					local hum = char and char:FindFirstChildOfClass("Humanoid")
-					local hrp = char and char:FindFirstChild("HumanoidRootPart")
-					local any = S.espOn or S.espEnemyBox or S.namesOn or S.healthOn or S.espEnemyDistance or S.espHeldWeapon
-					if not any or not char or not hrp or not hum or hum.Health <= 0 then
+					local hrp = char and (char:FindFirstChild("HumanoidRootPart") or char:FindFirstChild("Torso") or char:FindFirstChild("UpperTorso"))
+					if not char or not hrp or not hum or hum.Health <= 0 then
 						removeEsp(p)
 						return
 					end
 
-					local cam = Workspace.CurrentCamera
-					if not cam then return end
-					local ok, pos, onScreen = pcall(function()
-						return cam:WorldToViewportPoint(hrp.Position)
-					end)
-					if not ok or not onScreen then
-						removeEsp(p)
-						return
+					local c = espCache[p]
+					if not c then c = { draw = {} }; espCache[p] = c end
+
+					local col = Color3.fromRGB(80, 255, 120)
+					if type(S.espColorBox) == "table" and S.espColorBox[1] then
+						col = Color3.fromRGB(S.espColorBox[1], S.espColorBox[2], S.espColorBox[3])
 					end
 
-					local c = espCache[p] or {}
-					local col = espRGB("espColorBox", Color3.fromRGB(80, 255, 120))
-					local nameCol = espRGB("espColorName", Color3.fromRGB(255, 255, 255))
-
-					-- Highlight fallback
+					-- Highlight (box/chams/master)
 					if S.espOn or S.espEnemyBox or S.espGeometry then
-						if not c.Highlight or not c.Highlight.Parent then
+						if not c.hl or not c.hl.Parent then
 							local hl = Instance.new("Highlight")
-							hl.Name = "AE_ESP"
+							hl.Name = "AE_ESP_HL"
 							hl.Adornee = char
 							hl.FillColor = col
-							hl.OutlineColor = col
-							hl.FillTransparency = 0.85
-							hl.OutlineTransparency = 0.2
+							hl.OutlineColor = Color3.new(1, 1, 1)
+							hl.FillTransparency = (S.espGeometry and 0.5) or 0.82
+							hl.OutlineTransparency = 0
 							pcall(function() hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop end)
 							hl.Parent = char
-							c.Highlight = hl
+							c.hl = hl
 						else
-							c.Highlight.Adornee = char
-							c.Highlight.FillColor = col
-							c.Highlight.OutlineColor = col
+							c.hl.Adornee = char
+							c.hl.FillColor = col
+							c.hl.FillTransparency = (S.espGeometry and 0.5) or 0.82
 						end
-					elseif c.Highlight then
-						pcall(function() c.Highlight:Destroy() end)
-						c.Highlight = nil
+					elseif c.hl then
+						pcall(function() c.hl:Destroy() end)
+						c.hl = nil
 					end
 
-					if hasDrawing and (S.espOn or S.espEnemyBox) then
-						local sizeY = hrp.Size.Y * 2
-						local top = cam:WorldToViewportPoint(hrp.Position + Vector3.new(0, sizeY * 0.55, 0))
-						local bot = cam:WorldToViewportPoint(hrp.Position - Vector3.new(0, sizeY * 0.55, 0))
-						local h = math.max(12, math.abs(bot.Y - top.Y))
-						local w = h * 0.55
-						local x1, y1 = pos.X - w / 2, pos.Y - h / 2
-						local x2, y2 = pos.X + w / 2, pos.Y + h / 2
-						ensureBox(c, col)
-						setLine(c.Box[1], x1, y1, x2, y1, col, true)
-						setLine(c.Box[2], x2, y1, x2, y2, col, true)
-						setLine(c.Box[3], x2, y2, x1, y2, col, true)
-						setLine(c.Box[4], x1, y2, x1, y1, col, true)
-
-						-- Tracers (Kicia-style)
-						if S.espTracer then
-							if not c.Tracer then
-								c.Tracer = Drawing.new("Line")
-								c.Tracer.Thickness = 1
-							end
-							local vp = cam.ViewportSize
-							c.Tracer.From = Vector2.new(vp.X / 2, vp.Y)
-							c.Tracer.To = Vector2.new(pos.X, pos.Y)
-							c.Tracer.Color = col
-							c.Tracer.Visible = true
-						elseif c.Tracer then
-							c.Tracer.Visible = false
-						end
-
-						-- Chams / Geometry highlight
-						if S.espGeometry then
-							if not c.Highlight or not c.Highlight.Parent then
-								pcall(function()
-									local hl = Instance.new("Highlight")
-									hl.FillColor = col
-									hl.OutlineColor = Color3.new(1, 1, 1)
-									hl.FillTransparency = 0.55
-									hl.OutlineTransparency = 0
-									hl.Adornee = char
-									hl.Parent = char
-									c.Highlight = hl
-								end)
-							else
-								pcall(function()
-									c.Highlight.FillColor = col
-									c.Highlight.Adornee = char
-								end)
-							end
-						elseif c.Highlight then
-							pcall(function() c.Highlight:Destroy() end)
-							c.Highlight = nil
-						end
-
-						if S.namesOn or S.espOn or S.espEnemyName then
-							if not c.Name then
-								c.Name = Drawing.new("Text")
-								c.Name.Center = true
-								c.Name.Outline = true
-								c.Name.Size = 16
-							end
-							c.Name.Text = p.DisplayName or p.Name
-							c.Name.Color = nameCol
-							c.Name.Position = Vector2.new(pos.X, y1 - 16)
-							c.Name.Visible = true
-						elseif c.Name then
-							c.Name.Visible = false
-						end
-
-						if S.healthOn then
-							if not c.HealthBg then
-								c.HealthBg = Drawing.new("Line")
-								c.HealthBg.Thickness = 3
-								c.HealthBg.Color = Color3.new(0, 0, 0)
-								c.HealthBg.ZIndex = 1
-							end
-							if not c.Health then
-								c.Health = Drawing.new("Line")
-								c.Health.Thickness = 1.5
-								c.Health.ZIndex = 2
-							end
-							local pct = math.clamp(hum.Health / math.max(hum.MaxHealth, 1), 0, 1)
-							local hx = x1 - 5
-							c.HealthBg.From = Vector2.new(hx, y1)
-							c.HealthBg.To = Vector2.new(hx, y2)
-							c.HealthBg.Visible = true
-							c.Health.From = Vector2.new(hx, y2 - (y2 - y1) * pct)
-							c.Health.To = Vector2.new(hx, y2)
-							c.Health.Color = Color3.fromRGB(255 * (1 - pct), 255 * pct, 80)
-							c.Health.Visible = true
+					-- Billboard text (name / dist / health / weapon / rank / ws)
+					local wantText = S.espOn or S.namesOn or S.espEnemyName or S.healthOn
+						or S.espEnemyDistance or S.espHeldWeapon
+						or S.espEnemyRank or S.espEnemyWinstreak or S.espNumberEnemy
+					if wantText then
+						if not c.bb or not c.bb.Parent then
+							local bb = Instance.new("BillboardGui")
+							bb.Name = "AE_ESP_BB"
+							bb.AlwaysOnTop = true
+							bb.Size = UDim2.fromOffset(220, 70)
+							bb.StudsOffset = Vector3.new(0, 3.2, 0)
+							bb.MaxDistance = 2000
+							bb.Adornee = hrp
+							bb.Parent = hrp
+							local tl = Instance.new("TextLabel")
+							tl.Name = "Info"
+							tl.BackgroundTransparency = 1
+							tl.Size = UDim2.fromScale(1, 1)
+							tl.Font = Enum.Font.GothamBold
+							tl.TextSize = 14
+							tl.TextColor3 = Color3.new(1, 1, 1)
+							tl.TextStrokeTransparency = 0.3
+							tl.TextStrokeColor3 = Color3.new(0, 0, 0)
+							tl.TextYAlignment = Enum.TextYAlignment.Top
+							tl.Parent = bb
+							c.bb = bb
+							c.tl = tl
 						else
-							if c.Health then c.Health.Visible = false end
-							if c.HealthBg then c.HealthBg.Visible = false end
+							c.bb.Adornee = hrp
+							if c.bb.Parent ~= hrp then
+								pcall(function() c.bb.Parent = hrp end)
+							end
 						end
-
-						local extra = {}
+						local lines = {}
+						if S.espOn or S.namesOn or S.espEnemyName then
+							table.insert(lines, p.DisplayName or p.Name)
+						end
+						if S.healthOn or S.espEnemyHealth then
+							table.insert(lines, string.format("HP %.0f/%.0f", hum.Health, hum.MaxHealth))
+						end
 						if S.espEnemyDistance then
-							local my = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
-							if my then
-								table.insert(extra, math.floor((hrp.Position - my.Position).Magnitude) .. " studs")
+							local myRoot = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+							if myRoot then
+								table.insert(lines, string.format("%.0fm", (myRoot.Position - hrp.Position).Magnitude))
 							end
 						end
 						if S.espHeldWeapon then
-							local tool = char:FindFirstChildOfClass("Tool")
-							table.insert(extra, tool and tool.Name or "?")
+							local w = getWeaponName(char)
+							if w then table.insert(lines, w) end
 						end
-						if #extra > 0 then
-							if not c.Info then
-								c.Info = Drawing.new("Text")
-								c.Info.Center = true
-								c.Info.Outline = true
-								c.Info.Size = 14
-							end
-							c.Info.Text = table.concat(extra, " | ")
-							c.Info.Color = espRGB("espColorDistance", Color3.fromRGB(144, 255, 160))
-							c.Info.Position = Vector2.new(pos.X, y2 + 4)
-							c.Info.Visible = true
-						elseif c.Info then
-							c.Info.Visible = false
+						if S.espEnemyRank then
+							local rank = p:GetAttribute("Rank") or p:GetAttribute("Level")
+							pcall(function()
+								local ls = p:FindFirstChild("CustomLeaderstats") or p:FindFirstChild("leaderstats")
+								if ls then
+									local lv = ls:FindFirstChild("Level") or ls:FindFirstChild("Rank")
+									if lv then rank = lv.Value end
+								end
+							end)
+							if rank ~= nil then table.insert(lines, "Rank " .. tostring(rank)) end
 						end
-					else
-						if c.Box then for _, d in pairs(c.Box) do d.Visible = false end end
-						if c.Name then c.Name.Visible = false end
-						if c.Info then c.Info.Visible = false end
-						if c.Health then c.Health.Visible = false end
-						if c.HealthBg then c.HealthBg.Visible = false end
+						if S.espEnemyWinstreak then
+							local ws = p:GetAttribute("Winstreak") or p:GetAttribute("WinStreak")
+							pcall(function()
+								local ls = p:FindFirstChild("CustomLeaderstats") or p:FindFirstChild("leaderstats")
+								if ls then
+									local w = ls:FindFirstChild("Winstreak") or ls:FindFirstChild("WinStreak")
+									if w then ws = w.Value end
+								end
+							end)
+							if ws ~= nil then table.insert(lines, "WS " .. tostring(ws)) end
+						end
+						if c.tl then
+							c.tl.Text = table.concat(lines, "\n")
+							c.tl.TextColor3 = col
+						end
+					elseif c.bb then
+						pcall(function() c.bb:Destroy() end)
+						c.bb = nil
+						c.tl = nil
 					end
 
-					espCache[p] = c
+					-- Drawing box / tracer if available
+					local hasDrawing = type(Drawing) == "table" and type(Drawing.new) == "function"
+					if hasDrawing then
+						local cam = Workspace.CurrentCamera
+						if cam then
+							local sp, onScreen = cam:WorldToViewportPoint(hrp.Position)
+							if onScreen and sp.Z > 0 then
+								local pos = Vector2.new(sp.X, sp.Y)
+								if S.espOn or S.espEnemyBox then
+									if not c.draw.box then
+										c.draw.box = {}
+										for i = 1, 4 do
+											local ln = Drawing.new("Line")
+											ln.Thickness = 1
+											ln.Color = col
+											c.draw.box[i] = ln
+										end
+									end
+									local sizeY = (hrp.Size and hrp.Size.Y or 2) * 2
+									local top = cam:WorldToViewportPoint(hrp.Position + Vector3.new(0, sizeY * 0.55, 0))
+									local bot = cam:WorldToViewportPoint(hrp.Position - Vector3.new(0, sizeY * 0.55, 0))
+									local h = math.max(12, math.abs(bot.Y - top.Y))
+									local w = h * 0.55
+									local x1, y1 = pos.X - w / 2, pos.Y - h / 2
+									local x2, y2 = pos.X + w / 2, pos.Y + h / 2
+									local b = c.draw.box
+									local function setL(ln, a, b2, c2, d)
+										ln.From = Vector2.new(a, b2); ln.To = Vector2.new(c2, d)
+										ln.Color = col; ln.Visible = true
+									end
+									setL(b[1], x1, y1, x2, y1); setL(b[2], x2, y1, x2, y2)
+									setL(b[3], x2, y2, x1, y2); setL(b[4], x1, y2, x1, y1)
+								elseif c.draw.box then
+									for _, ln in pairs(c.draw.box) do pcall(function() ln.Visible = false end) end
+								end
+								if S.espTracer then
+									if not c.draw.tracer then
+										local ln = Drawing.new("Line")
+										ln.Thickness = 1
+										c.draw.tracer = ln
+									end
+									local vp = cam.ViewportSize
+									c.draw.tracer.From = Vector2.new(vp.X / 2, vp.Y)
+									c.draw.tracer.To = pos
+									c.draw.tracer.Color = col
+									c.draw.tracer.Visible = true
+								elseif c.draw.tracer then
+									c.draw.tracer.Visible = false
+								end
+							else
+								if c.draw.box then for _, ln in pairs(c.draw.box) do pcall(function() ln.Visible = false end) end end
+								if c.draw.tracer then c.draw.tracer.Visible = false end
+							end
+						end
+					end
 				end
 
 				trackConn(RunService.RenderStepped:Connect(function()
-					local any = S.espOn or S.espEnemyBox or S.namesOn or S.healthOn or S.espEnemyDistance or S.espHeldWeapon or S.espGeometry
-					if not any then
+					if not anyEsp() then
 						for p in pairs(espCache) do removeEsp(p) end
 						return
 					end
@@ -6260,41 +6771,27 @@ env._pageUI = {
 					end
 				end))
 				trackConn(Players.PlayerRemoving:Connect(function(p) removeEsp(p) end))
+				print("[anti-enhancement] ESP engine ready (Highlight+Billboard+Drawing)")
 			end
-			
-			
+
 			__setupEsp()
 			end
 
 			local function __setupExtraLoops()
-				randomTpButton.MouseButton1Click:Connect(function()
+				-- Keep silent/rage UseItem hooks alive (modules load mid-match)
+				trackConn(RunService.Heartbeat:Connect(function()
+					if not (S.silentAimOn or S.ragebotOn) then return end
 					pcall(function()
-						local _, myRoot = getSafeParts()
-						if not myRoot then return end
-						local validTargets = {}
-						for _, p in ipairs(Players:GetPlayers()) do
-							if p ~= player then
-								local char = p.Character
-								if char then
-									local hum = char:FindFirstChildOfClass("Humanoid")
-									local head = char:FindFirstChild("Head")
-									if hum and hum.Health > 0 and head then table.insert(validTargets, head) end
-								end
-							end
-						end
-						if #validTargets > 0 then
-							local randomHead = validTargets[math.random(1, #validTargets)]
-							local randomAngle = math.random() * math.pi * 2
-							local offsetDir = Vector3.new(math.cos(randomAngle), 0, math.sin(randomAngle))
-							myRoot.CFrame = CFrame.new(randomHead.Position + (offsetDir * 5), randomHead.Position)
-						end
+						if type(saInstallHook) == "function" then saInstallHook() end
 					end)
-				end)
+				end))
+
+				-- randomTpButton removed — no head-TP click handler
 	
 				trackConn(RunService.RenderStepped:Connect(function()
 					if not S.aimbotOn then return end
-					-- Only block when legacy main window is actually visible (Obsidian open is OK)
-					if env._mainWindow and env._mainWindow.Visible then return end
+					-- Only block when legacy ScreenGui is enabled AND visible (not Obsidian)
+					if gui and gui.Enabled and env._mainWindow and env._mainWindow.Visible then return end
 					pcall(function()
 						local currentCam = getActiveCamera()
 						if not currentCam then return end
@@ -6407,14 +6904,16 @@ env._pageUI = {
 							if onScreen then
 								local dx = screenPos.X - mousePos.X
 								local dy = screenPos.Y - mousePos.Y
-								-- aimbotSmooth 1~500: lower = snappier, higher = smoother/slower
-								local smooth = math.clamp(tonumber(S.aimbotSmooth) or tonumber(S.aimbotStrength) or 50, 1, 500)
-								local strength = math.clamp(50 / smooth, 0.02, 1)
-								local moveX = dx * strength
-								local moveY = dy * strength
-								if math.abs(moveX) < 0.15 and math.abs(moveY) < 0.15 then
-									return
+								-- Hub StrengthToSmooth: Strength 100 = instant snap, 1 = slow
+								local str = math.clamp(tonumber(S.aimbotStrength) or 90, 1, 100)
+								local smoothDiv = 1 + (100 - str) / 99 * 3 -- Hub StrengthToSmooth
+								local moveX, moveY
+								if smoothDiv <= 1.01 then
+									moveX, moveY = math.round(dx), math.round(dy)
+								else
+									moveX, moveY = math.round(dx / smoothDiv), math.round(dy / smoothDiv)
 								end
+								if moveX == 0 and moveY == 0 then return end
 								if mousemoverel then
 									mousemoverel(moveX, moveY)
 								else
@@ -6879,7 +7378,8 @@ env._pageUI = {
 		-- Obsidian UI (deividcomsono/Obsidian / Linoria-style)
 		-- Primary menu — legacy ScreenGui kept for popups (skin/sky/config)
 		-- ============================================================
-		pcall(function()
+		do
+			local okObs, errObs = pcall(function()
 			local repo = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main/"
 			local Library = loadstring(game:HttpGet(repo .. "Library.lua"))()
 			local ThemeManager = loadstring(game:HttpGet(repo .. "addons/ThemeManager.lua"))()
@@ -6890,16 +7390,17 @@ env._pageUI = {
 			Library.ForceCheckbox = false
 			Library.ShowToggleFrameInKeybinds = true
 
-			-- Hide legacy main window (keep popup ScreenGuis working)
+			-- Hide legacy main window completely (Obsidian is primary UI)
 			pcall(function()
 				if gui then gui.Enabled = false end
 				if keybindGui then keybindGui.Enabled = false end
 				if watermarkGui then watermarkGui.Enabled = false end
+				if env._mainWindow then env._mainWindow.Visible = false end
 			end)
 
 			local Window = Library:CreateWindow({
 				Title = "anti enhancement",
-				Footer = "v0.2.8.6  |  discord.gg/6pH3NGVtm",
+				Footer = "v0.2.8.8  |  discord.gg/6pH3NGVtm",
 				NotifySide = "Right",
 				ShowCustomCursor = true,
 				AutoShow = true,
@@ -6926,11 +7427,12 @@ env._pageUI = {
 				Default = S.silentAimOn == true,
 				Callback = function(v)
 					S.silentAimOn = v
+					if v then pcall(function() if type(saInstallHook) == "function" then saInstallHook() end end) end
 					if env._silentAimSet then env._silentAimSet(v) end
 					pcall(function() if refs and refs.silentAimButton and setToggle then setToggle(refs.silentAimButton, v, "silent aim") end end)
 				end,
 			}):AddKeyPicker("SilentAimKey", {
-				Default = "E",
+				Default = "None",
 				Mode = "Toggle",
 				Text = "Silent Aim",
 				SyncToggleState = true,
@@ -6938,9 +7440,18 @@ env._pageUI = {
 
 			CombatLeft:AddSlider("SilentFOV", {
 				Text = "Silent FOV",
-				Default = tonumber(S.silentAimFOV) or 180,
+				Default = tonumber(S.silentAimFOV) or 350,
 				Min = 1, Max = 5000, Rounding = 0,
-				Callback = function(v) S.silentAimFOV = v; env._silentAimFOV = v end,
+				Callback = function(v)
+					S.silentAimFOV = v
+					env._silentAimFOV = v
+					pcall(function()
+						if fovCircle then
+							fovCircle.Radius = v
+							fovCircle.Visible = S.silentAimOn == true
+						end
+					end)
+				end,
 			})
 
 			CombatLeft:AddDropdown("SilentHitPart", {
@@ -6960,19 +7471,28 @@ env._pageUI = {
 					pcall(function() if refs and refs.aimbotButton and setToggle then setToggle(refs.aimbotButton, v, "aimbot") end end)
 				end,
 			}):AddKeyPicker("AimbotKey", {
-				Default = "Q",
+				Default = "None",
 				Mode = "Toggle",
 				Text = "Aimbot",
 				SyncToggleState = true,
 			})
 
+			CombatLeft:AddSlider("AimbotStrength", {
+				Text = "Aimbot Strength",
+				Default = tonumber(S.aimbotStrength) or 90,
+				Min = 1, Max = 100, Rounding = 0,
+				Callback = function(v)
+					S.aimbotStrength = v
+				end,
+			})
+
 			CombatLeft:AddSlider("AimbotSmooth", {
 				Text = "Aimbot Smooth",
-				Default = tonumber(S.aimbotSmooth) or 50,
+				Default = tonumber(S.aimbotSmooth) or 12,
 				Min = 1, Max = 500, Rounding = 0,
 				Callback = function(v)
 					S.aimbotSmooth = v
-					S.aimbotStrength = math.clamp(math.floor(50 / math.max(v, 1) * 100), 1, 100)
+					-- strength is independent (1~100); smooth only softens
 				end,
 			})
 
@@ -7006,7 +7526,7 @@ env._pageUI = {
 					if env._riv_startRagebot then env._riv_startRagebot(v) end
 				end,
 			}):AddKeyPicker("RagebotKey", {
-				Default = "R",
+				Default = "None",
 				Mode = "Toggle",
 				Text = "Ragebot",
 				SyncToggleState = true,
@@ -7014,7 +7534,7 @@ env._pageUI = {
 
 			CombatRight:AddSlider("RageStability", {
 				Text = "Stability",
-				Default = math.floor((tonumber(S.ragebotStability) or 0) * 100),
+				Default = math.floor((tonumber(S.ragebotStability) or 0.15) * 100),
 				Min = 0, Max = 150, Rounding = 0, Suffix = "%",
 				Callback = function(v)
 					S.ragebotStability = v / 100
@@ -7024,13 +7544,52 @@ env._pageUI = {
 
 			CombatRight:AddSlider("RageShootFrames", {
 				Text = "Shoot Frames",
-				Default = tonumber(S.ragebotShootFrames) or 3,
+				Default = tonumber(S.ragebotShootFrames) or 1,
 				Min = 1, Max = 10, Rounding = 0,
 				Callback = function(v)
 					S.ragebotShootFrames = v
 					env._ragebotShootFrames = v
 				end,
 			})
+
+			CombatRight:AddToggle("RagePrioritizeHackers", {
+				Text = "Prioritize Hackers",
+				Default = S.ragePrioritizeHackers == true,
+				Callback = function(v)
+					S.ragePrioritizeHackers = v
+				end,
+			})
+			CombatRight:AddToggle("RageHealthLead", {
+				Text = "Utilize Health Lead",
+				Default = S.rageUtilizeHealthLead == true,
+				Callback = function(v)
+					S.rageUtilizeHealthLead = v
+				end,
+			})
+			CombatRight:AddDropdown("RageEvasionMode", {
+				Text = "Evasion Mode",
+				Values = { "None", "Random", "ProjectileBreaker", "Translocate" },
+				Default = tostring(S.rageEvasionMode or "None"),
+				Callback = function(v)
+					S.rageEvasionMode = v
+				end,
+			})
+			CombatRight:AddToggle("RageWeaponPrimary", {
+				Text = "Weapon: Primary",
+				Default = S.rageWeaponPrimary ~= false,
+				Callback = function(v) S.rageWeaponPrimary = v end,
+			})
+			CombatRight:AddToggle("RageWeaponSecondary", {
+				Text = "Weapon: Secondary",
+				Default = S.rageWeaponSecondary ~= false,
+				Callback = function(v) S.rageWeaponSecondary = v end,
+			})
+			CombatRight:AddToggle("RageWeaponMelee", {
+				Text = "Weapon: Melee",
+				Default = S.rageWeaponMelee ~= false,
+				Callback = function(v) S.rageWeaponMelee = v end,
+			})
+
 
 			CombatRight:AddDivider()
 			CombatRight:AddToggle("NoSpread", {
@@ -7076,13 +7635,18 @@ env._pageUI = {
 
 			-- ---- Visuals ----
 			local VisLeft = Tabs.Visuals:AddGroupbox({ Side = "Left", Name = "ESP", IconName = "eye" })
-			local VisRight = Tabs.Visuals:AddGroupbox({ Side = "Right", Name = "Screen / Sky", IconName = "image" })
+			-- Screen / Sky removed (skybox is on World tab only)
 
 			VisLeft:AddToggle("ESP", {
 				Text = "ESP",
 				Default = S.espOn == true,
 				Callback = function(v)
 					S.espOn = v
+					if v then
+						S.espEnemyBox = true
+						S.namesOn = true
+						S.healthOn = true
+					end
 					if env._espSet then env._espSet(v) end
 				end,
 			}):AddKeyPicker("ESPKey", { Default = "None", Mode = "Toggle", Text = "ESP", SyncToggleState = true })
@@ -7099,53 +7663,7 @@ env._pageUI = {
 			VisLeft:AddToggle("ESPGeometry", { Text = "Geometry / Chams", Default = S.espGeometry == true, Callback = function(v) S.espGeometry = v end })
 			VisLeft:AddToggle("ESPTracer", { Text = "Tracers", Default = S.espTracer == true, Callback = function(v) S.espTracer = v end })
 			VisLeft:AddToggle("ESPSkeleton", { Text = "Skeleton", Default = S.espSkeleton == true, Callback = function(v) S.espSkeleton = v end })
-
-			VisRight:AddButton({
-				Text = "Open Screen Effects",
-				Func = function()
-					pcall(function()
-						if env._openShaderMenu then env._openShaderMenu()
-						elseif openShaderMenu then openShaderMenu() end
-					end)
-				end,
-			})
-			VisRight:AddButton({
-				Text = "Open Skybox Menu",
-				Func = function()
-					pcall(function()
-						if env._openSkyboxMenu then env._openSkyboxMenu()
-						elseif openSkyboxMenu then openSkyboxMenu() end
-					end)
-				end,
-			})
-			VisRight:AddButton({
-				Text = "Open Skin Changer",
-				Func = function()
-					pcall(function()
-						if env._installHarionSkin then env._installHarionSkin() end
-					end)
-					-- Temporarily show legacy main UI so the existing skin picker path can run
-					pcall(function()
-						if gui then gui.Enabled = true end
-						if type(showPage) == "function" then showPage("main") end
-					end)
-					pcall(function()
-						if env._openSkinPicker then
-							env._openSkinPicker()
-						elseif allSkinBtn then
-							-- fallback: user clicks OPEN SKIN on legacy panel
-						end
-					end)
-					Library:Notify({
-						Title = "Skin Changer",
-						Description = "Legacy panel shown — press OPEN SKIN CHANGER on main tab if picker did not open",
-						Time = 4,
-					})
-				end,
-			})
-
-			
-			-- ---- World (Kicia skyboxes in-list) ----
+-- ---- World (Kicia skyboxes in-list) ----
 			local WorldLeft = Tabs.World:AddGroupbox({ Side = "Left", Name = "Skybox", IconName = "cloud" })
 			do
 				local names = {}
@@ -7216,6 +7734,20 @@ env._pageUI = {
 						end)
 					end
 				end,
+			})
+			CharLeft:AddToggle("Fly", {
+				Text = "Fly",
+				Default = S.flyOn == true,
+				Callback = function(v)
+					S.flyOn = v
+					if env._setFly then env._setFly(v) end
+				end,
+			}):AddKeyPicker("FlyKey", { Default = "None", Mode = "Toggle", Text = "Fly", SyncToggleState = true })
+			CharLeft:AddSlider("FlySpeed", {
+				Text = "Fly Speed",
+				Default = tonumber(S.flySpeed) or 50,
+				Min = 10, Max = 300, Rounding = 0,
+				Callback = function(v) S.flySpeed = v end,
 			})
 			CharLeft:AddToggle("Noclip", {
 				Text = "Noclip",
@@ -7409,17 +7941,27 @@ env._pageUI = {
 
 			Library:Notify({
 				Title = "anti enhancement",
-				Description = "v0.2.8.6 Obsidian UI loaded",
+				Description = "v0.2.8.8 Obsidian UI loaded",
 				Time = 4,
 			})
 
 			env._AE_Library = Library
 			env._AE_ObsidianWindow = Window
 			print("[anti-enhancement] Obsidian UI ready")
-		end)
+			end)
+			if not okObs then
+				warn("[anti-enhancement] Obsidian UI failed: ", errObs)
+			else
+				-- Keep legacy hidden while Obsidian is up
+				pcall(function()
+					if gui then gui.Enabled = false end
+					if keybindGui then keybindGui.Enabled = false end
+				end)
+			end
+		end
 
 
-		print("anti-enhancement v0.2.8.6 Enhanced & Loaded Successfully! (Obsidian UI + Silent Aim + Skin + Spoof + Loadout)")
+		print("anti-enhancement v0.2.8.8 Enhanced & Loaded Successfully! (Obsidian UI + Silent Aim + Skin + Spoof + Loadout)")
 	end)
 end
 
@@ -7459,7 +8001,7 @@ else
 	keyTitle.Position = UDim2.fromOffset(0, 10)
 	keyTitle.BackgroundTransparency = 1
 	keyTitle.RichText = true
-	keyTitle.Text = '<font color="rgb(100,180,255)">anti enhancement Key System (anti enhancement v0.2.8.6)</font>'
+	keyTitle.Text = '<font color="rgb(100,180,255)">anti enhancement Key System (anti enhancement v0.2.8.8)</font>'
 	keyTitle.TextSize, keyTitle.Font = 13, Enum.Font.Code
 	keyTitle.TextXAlignment = Enum.TextXAlignment.Center
 	keyTitle.Parent = keyFrame
